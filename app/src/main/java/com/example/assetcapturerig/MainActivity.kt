@@ -18,7 +18,6 @@ import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.compose.ui.graphics.Color as ComposeColor
 import com.google.android.filament.Box
 import com.google.android.filament.Engine
 import com.google.android.filament.IndexBuffer
@@ -34,6 +33,7 @@ import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.node.AnchorNode
+import io.github.sceneview.math.Color as SceneColor
 import io.github.sceneview.math.Position
 import io.github.sceneview.math.Rotation
 import io.github.sceneview.math.Scale
@@ -370,47 +370,47 @@ class MainActivity : AppCompatActivity() {
 
             // Translucent face fills (alpha < 1.0 selects Filament transparent material)
             matRedFace = ml.createColorInstance(
-                color = ComposeColor(0.97f, 0.32f, 0.29f, 0.34f),
+                color = SceneColor(0.97f, 0.32f, 0.29f, 0.34f),
                 metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
             )
             matGreenFace = ml.createColorInstance(
-                color = ComposeColor(0.25f, 0.73f, 0.31f, 0.34f),
+                color = SceneColor(0.25f, 0.73f, 0.31f, 0.34f),
                 metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
             )
             matGreyFace = ml.createColorInstance(
-                color = ComposeColor(0.55f, 0.58f, 0.62f, 0.22f),
+                color = SceneColor(0.55f, 0.58f, 0.62f, 0.22f),
                 metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
             )
 
             // Crisp opaque wireframe & reticle beam materials
             matRedWire = ml.createColorInstance(
-                color = ComposeColor(0.99f, 0.30f, 0.27f, 1.0f),
+                color = SceneColor(0.99f, 0.30f, 0.27f, 1.0f),
                 metallic = 0.0f, roughness = 0.65f, reflectance = 0.20f
             )
             matGreenWire = ml.createColorInstance(
-                color = ComposeColor(0.22f, 0.85f, 0.34f, 1.0f),
+                color = SceneColor(0.22f, 0.85f, 0.34f, 1.0f),
                 metallic = 0.0f, roughness = 0.65f, reflectance = 0.20f
             )
             matGreyWire = ml.createColorInstance(
-                color = ComposeColor(0.62f, 0.66f, 0.70f, 1.0f),
+                color = SceneColor(0.62f, 0.66f, 0.70f, 1.0f),
                 metallic = 0.0f, roughness = 0.75f, reflectance = 0.15f
             )
 
             // Pre-lock 3D Volumetric Encapsulating Ring materials
             matRingClingWall = ml.createColorInstance(
-                color = ComposeColor(0.25f, 0.73f, 0.31f, 0.22f),
+                color = SceneColor(0.25f, 0.73f, 0.31f, 0.22f),
                 metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
             )
             matRingClingWire = ml.createColorInstance(
-                color = ComposeColor(0.25f, 0.88f, 0.36f, 1.0f),
+                color = SceneColor(0.25f, 0.88f, 0.36f, 1.0f),
                 metallic = 0.0f, roughness = 0.60f, reflectance = 0.20f
             )
             matRingScanWall = ml.createColorInstance(
-                color = ComposeColor(0.35f, 0.65f, 1.00f, 0.18f),
+                color = SceneColor(0.35f, 0.65f, 1.00f, 0.18f),
                 metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
             )
             matRingScanWire = ml.createColorInstance(
-                color = ComposeColor(0.35f, 0.65f, 1.00f, 1.0f),
+                color = SceneColor(0.35f, 0.65f, 1.00f, 1.0f),
                 metallic = 0.0f, roughness = 0.60f, reflectance = 0.20f
             )
 
@@ -926,7 +926,6 @@ class MainActivity : AppCompatActivity() {
             if (len < 1e-5f) return
             val tx = dx / len; val ty = dy / len; val tz = dz / len
 
-            // Pick a reference vector not parallel to tangent
             val rx: Float; val ry: Float; val rz: Float
             if (abs(ty) < 0.9f) {
                 rx = 0f; ry = 1f; rz = 0f
@@ -934,28 +933,24 @@ class MainActivity : AppCompatActivity() {
                 rx = 1f; ry = 0f; rz = 0f
             }
 
-            // First orthogonal axis u = normalize(t x r)
             var ux = ty * rz - tz * ry
             var uy = tz * rx - tx * rz
             var uz = tx * ry - ty * rx
             val uLen = sqrt(ux * ux + uy * uy + uz * uz).coerceAtLeast(1e-5f)
             ux = (ux / uLen) * halfThick; uy = (uy / uLen) * halfThick; uz = (uz / uLen) * halfThick
 
-            // Second orthogonal axis v = normalize(t x u)
             var vx = ty * uz - tz * uy
             var vy = tz * ux - tx * uz
             var vz = tx * uy - ty * ux
             val vLen = sqrt(vx * vx + vy * vy + vz * vz).coerceAtLeast(1e-5f)
             vx = (vx / vLen) * halfThick; vy = (vy / vLen) * halfThick; vz = (vz / vLen) * halfThick
 
-            // Ribbon 1 along u
             addDoubleSidedQuad(
                 floatArrayOf(a[0] - ux, a[1] - uy, a[2] - uz),
                 floatArrayOf(a[0] + ux, a[1] + uy, a[2] + uz),
                 floatArrayOf(b[0] + ux, b[1] + uy, b[2] + uz),
                 floatArrayOf(b[0] - ux, b[1] - uy, b[2] - uz)
             )
-            // Ribbon 2 along v
             addDoubleSidedQuad(
                 floatArrayOf(a[0] - vx, a[1] - vy, a[2] - vz),
                 floatArrayOf(a[0] + vx, a[1] + vy, a[2] + vz),
