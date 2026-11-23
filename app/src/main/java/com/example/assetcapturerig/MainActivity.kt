@@ -18,6 +18,13 @@ import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.ui.graphics.Color as ComposeColor
+import com.google.android.filament.Box
+import com.google.android.filament.Engine
+import com.google.android.filament.IndexBuffer
+import com.google.android.filament.MaterialInstance
+import com.google.android.filament.RenderableManager
+import com.google.android.filament.VertexBuffer
 import com.google.ar.core.Anchor
 import com.google.ar.core.Config
 import com.google.ar.core.Coordinates2d
@@ -26,6 +33,12 @@ import com.google.ar.core.Plane
 import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARSceneView
+import io.github.sceneview.ar.node.AnchorNode
+import io.github.sceneview.math.Position
+import io.github.sceneview.math.Rotation
+import io.github.sceneview.math.Scale
+import io.github.sceneview.node.MeshNode
+import io.github.sceneview.node.Node
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -54,7 +67,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var rootLayout: FrameLayout
     private lateinit var sceneView: ARSceneView
-    private lateinit var overlayView: PrismOverlayView
+    private lateinit var overlayView: CrosshairOverlayView
     private lateinit var snapFlash: View
 
     private lateinit var targetBadge: TextView
@@ -84,8 +97,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (3D Ring Cling + MagicTouch TFLite)\n")
+    private val debugLog = StringBuilder("App Initialized (GPU AnchorNode + MagicTouch)\n")
     private var toneGen: ToneGenerator? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private var tfliteInterpreter: Interpreter? = null
     private val modelAssetName = "magic_touch.tflite"
@@ -94,15 +108,54 @@ class MainActivity : AppCompatActivity() {
     private var isBoxPlaced = false
     private var isCapturing = false
     private var isBatchUploading = false
+    private var isTakingCleanSnapshot = false
     private var lastFrame: Frame? = null
     private var prismAnchor: Anchor? = null
+    private var trackedTablePlane: Plane? = null
     private var initialAzimuth = 0f
     private var alignStartTime: Long? = null
     private var cooldownUntil: Long = 0L
+    private var lastHudUpdateMs: Long = 0L
 
     private var prismWidth = 0.10f
     private var prismDepth = 0.10f
     private var prismHeight = 0.05f
+
+    // =========================================================
+    // GPU SCENEGRAPH NODES & FILAMENT MATERIALS (ZERO PHASE LAG)
+    // =========================================================
+    private var gpuMaterialsReady = false
+    private lateinit var matRedFace: MaterialInstance
+    private lateinit var matGreenFace: MaterialInstance
+    private lateinit var matGreyFace: MaterialInstance
+    private lateinit var matRedWire: MaterialInstance
+    private lateinit var matGreenWire: MaterialInstance
+    private lateinit var matGreyWire: MaterialInstance
+    private lateinit var matRingClingWall: MaterialInstance
+    private lateinit var matRingClingWire: MaterialInstance
+    private lateinit var matRingScanWall: MaterialInstance
+    private lateinit var matRingScanWire: MaterialInstance
+
+    // Pre-Lock GPU 3D Volumetric Encapsulating Ring
+    private var liveRingRoot: Node? = null
+    private var liveRingWallNode: MeshNode? = null
+    private var liveRingWireNode: MeshNode? = null
+    private var liveRingBuffers = mutableListOf<Pair<VertexBuffer, IndexBuffer>>()
+    private var liveRingIsClingColor = false
+
+    // Locked GPU 3D Bounding Prism attached to ARCore AnchorNode
+    private var prismAnchorNode: AnchorNode? = null
+    private var prismYawNode: Node? = null
+    private val facetFaceNodes = arrayOfNulls<MeshNode>(9)
+    private val facetWireNodes = arrayOfNulls<MeshNode>(9)
+    private var structuralFaceNode: MeshNode? = null
+    private var structuralWireNode: MeshNode? = null
+    private var activeReticleNode: MeshNode? = null
+    private var reticleBuiltForStep = -1
+    private var lastReticleAlignedState = false
+    private var lastVisualStepIdx = -1
+    private val prismBuffers = mutableListOf<Pair<VertexBuffer, IndexBuffer>>()
+    private var reticleBuffers: Pair<VertexBuffer, IndexBuffer>? = null
 
     // =========================================================
     // 3D ENCAPSULATING RING LIVE CLING STATE (PRE-LOCK)
@@ -196,7 +249,8 @@ class MainActivity : AppCompatActivity() {
 
         initMagicTouchTFLite()
 
-        overlayView = PrismOverlayView(this)
+        // Lightweight static 2D screen crosshair only (all 3D geometry is now GPU-rendered)
+        overlayView = CrosshairOverlayView(this)
         rootLayout.addView(overlayView, 1)
 
         buildThumbnailStrip()
@@ -209,6 +263,11 @@ class MainActivity : AppCompatActivity() {
 
         sceneView.planeRenderer.isEnabled = false
         sceneView.planeRenderer.isVisible = false
+
+        // Initialize Filament GPU materials and unit pre-lock 3D ring on the main thread
+        sceneView.post {
+            initGpuMaterialsAndLiveRing()
+        }
 
         sceneView.onSessionUpdated = { _, frame ->
             lastFrame = frame
@@ -240,7 +299,7 @@ class MainActivity : AppCompatActivity() {
 
         scaleReadout.setOnClickListener {
             initialAzimuth += Math.toRadians(15.0).toFloat()
-            overlayView.postInvalidate()
+            syncPrismYawTransform()
             Toast.makeText(this, "Rotated +15° (Long-press for 90°)", Toast.LENGTH_SHORT).show()
         }
         valScale.setOnClickListener { showDebugDialog() }
@@ -252,7 +311,8 @@ class MainActivity : AppCompatActivity() {
             prismDepth = temp
             initialAzimuth += (Math.PI / 2.0).toFloat()
             updateScaleLabels()
-            overlayView.postInvalidate()
+            syncPrismYawTransform()
+            rebuildPrismGpuMeshes()
             Toast.makeText(this, "Rotated 90°", Toast.LENGTH_SHORT).show()
             true
         }
@@ -264,6 +324,13 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         try {
+            clearPrismGpuMeshes()
+            destroyLiveRingGpuMeshes()
+            prismAnchorNode?.let {
+                sceneView.removeChildNode(it)
+                it.destroy()
+            }
+            prismAnchor?.detach()
             tfliteInterpreter?.close()
         } catch (e: Exception) {}
     }
@@ -285,7 +352,7 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("3D Ring + MagicTouch Diagnostics")
+                .setTitle("GPU AnchorNode + MagicTouch Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
@@ -293,6 +360,691 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // =========================================================================
+    // FILAMENT GPU MATERIALS & PROCEDURAL 3D MESH ENGINE
+    // =========================================================================
+    private fun initGpuMaterialsAndLiveRing() {
+        if (gpuMaterialsReady) return
+        try {
+            val ml = sceneView.materialLoader
+
+            // Translucent face fills (alpha < 1.0 selects Filament transparent material)
+            matRedFace = ml.createColorInstance(
+                color = ComposeColor(0.97f, 0.32f, 0.29f, 0.34f),
+                metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
+            )
+            matGreenFace = ml.createColorInstance(
+                color = ComposeColor(0.25f, 0.73f, 0.31f, 0.34f),
+                metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
+            )
+            matGreyFace = ml.createColorInstance(
+                color = ComposeColor(0.55f, 0.58f, 0.62f, 0.22f),
+                metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
+            )
+
+            // Crisp opaque wireframe & reticle beam materials
+            matRedWire = ml.createColorInstance(
+                color = ComposeColor(0.99f, 0.30f, 0.27f, 1.0f),
+                metallic = 0.0f, roughness = 0.65f, reflectance = 0.20f
+            )
+            matGreenWire = ml.createColorInstance(
+                color = ComposeColor(0.22f, 0.85f, 0.34f, 1.0f),
+                metallic = 0.0f, roughness = 0.65f, reflectance = 0.20f
+            )
+            matGreyWire = ml.createColorInstance(
+                color = ComposeColor(0.62f, 0.66f, 0.70f, 1.0f),
+                metallic = 0.0f, roughness = 0.75f, reflectance = 0.15f
+            )
+
+            // Pre-lock 3D Volumetric Encapsulating Ring materials
+            matRingClingWall = ml.createColorInstance(
+                color = ComposeColor(0.25f, 0.73f, 0.31f, 0.22f),
+                metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
+            )
+            matRingClingWire = ml.createColorInstance(
+                color = ComposeColor(0.25f, 0.88f, 0.36f, 1.0f),
+                metallic = 0.0f, roughness = 0.60f, reflectance = 0.20f
+            )
+            matRingScanWall = ml.createColorInstance(
+                color = ComposeColor(0.35f, 0.65f, 1.00f, 0.18f),
+                metallic = 0.0f, roughness = 0.90f, reflectance = 0.10f
+            )
+            matRingScanWire = ml.createColorInstance(
+                color = ComposeColor(0.35f, 0.65f, 1.00f, 1.0f),
+                metallic = 0.0f, roughness = 0.60f, reflectance = 0.20f
+            )
+
+            buildUnitLiveRingGpuMesh()
+            gpuMaterialsReady = true
+            logDebug("✓ Filament GPU Materials & 3D Ring Ready")
+        } catch (e: Exception) {
+            logDebug("❌ GPU Material Init Failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /**
+     * Builds the pre-lock 3D Volumetric Encapsulating Ring once at unit scale (rx=1, rz=1, h=1).
+     * Per-frame updates only modify liveRingRoot's position/rotation/scale (zero allocations).
+     */
+    private fun buildUnitLiveRingGpuMesh() {
+        val engine = sceneView.engine
+        destroyLiveRingGpuMeshes()
+
+        val steps = 36
+        val wallBuilder = GpuMeshBuilder()
+        val wireBuilder = GpuMeshBuilder()
+
+        val basePts = Array(steps) { FloatArray(3) }
+        val midPts = Array(steps) { FloatArray(3) }
+        val topPts = Array(steps) { FloatArray(3) }
+
+        for (i in 0 until steps) {
+            val ang = 2.0 * Math.PI * i / steps
+            val c = cos(ang)
+            val s = sin(ang)
+            val lx = (c.sign * abs(c).pow(0.82)).toFloat()
+            val lz = (s.sign * abs(s).pow(0.82)).toFloat()
+            basePts[i] = floatArrayOf(lx, 0f, lz)
+            midPts[i] = floatArrayOf(lx, 0.5f, lz)
+            topPts[i] = floatArrayOf(lx, 1.0f, lz)
+        }
+
+        val barThick = 0.026f
+        for (i in 0 until steps) {
+            val next = (i + 1) % steps
+            wallBuilder.addDoubleSidedQuad(basePts[i], basePts[next], topPts[next], topPts[i])
+
+            wireBuilder.addCrossedBeam(basePts[i], basePts[next], barThick)
+            wireBuilder.addCrossedBeam(topPts[i], topPts[next], barThick * 0.85f)
+            if (i % 2 == 0) {
+                wireBuilder.addCrossedBeam(midPts[i], midPts[next], barThick * 0.60f)
+            }
+            if (i % 3 == 0) {
+                val ribThick = if (i % 9 == 0) barThick * 0.95f else barThick * 0.55f
+                wireBuilder.addCrossedBeam(basePts[i], topPts[i], ribThick)
+            }
+        }
+
+        val root = Node(engine).apply {
+            isVisible = false
+        }
+        val (wallNode, wallBufs) = wallBuilder.buildMeshNode(engine, matRingScanWall)
+        val (wireNode, wireBufs) = wireBuilder.buildMeshNode(engine, matRingScanWire)
+
+        root.addChildNode(wallNode)
+        root.addChildNode(wireNode)
+        sceneView.addChildNode(root)
+
+        liveRingRoot = root
+        liveRingWallNode = wallNode
+        liveRingWireNode = wireNode
+        liveRingBuffers.add(wallBufs)
+        liveRingBuffers.add(wireBufs)
+        liveRingIsClingColor = false
+    }
+
+    private fun destroyLiveRingGpuMeshes() {
+        val engine = sceneView.engine
+        liveRingWallNode?.destroy()
+        liveRingWireNode?.destroy()
+        liveRingRoot?.let {
+            sceneView.removeChildNode(it)
+            it.destroy()
+        }
+        for ((vb, ib) in liveRingBuffers) {
+            try { engine.destroyVertexBuffer(vb) } catch (_: Exception) {}
+            try { engine.destroyIndexBuffer(ib) } catch (_: Exception) {}
+        }
+        liveRingBuffers.clear()
+        liveRingRoot = null
+        liveRingWallNode = null
+        liveRingWireNode = null
+    }
+
+    private fun setNodeMaterial(node: Node?, mat: MaterialInstance) {
+        val entity = node?.entity ?: return
+        val rm = sceneView.engine.renderableManager
+        val inst = rm.getInstance(entity)
+        if (inst != 0) {
+            rm.setMaterialInstanceAt(inst, 0, mat)
+        }
+    }
+
+    private fun syncPrismYawTransform() {
+        val yawDeg = Math.toDegrees(initialAzimuth.toDouble()).toFloat()
+        prismYawNode?.rotation = Rotation(0f, yawDeg, 0f)
+    }
+
+    /**
+     * Attaches (or re-attaches) the GPU 3D Bounding Prism to a plane-grounded ARCore AnchorNode
+     * so Filament renders camera feed + 3D cage in the exact same GPU frame (0 ms lag).
+     */
+    private fun attachPrismToAnchor(newAnchor: Anchor) {
+        val engine = sceneView.engine
+        clearPrismGpuMeshes()
+
+        prismAnchorNode?.let { oldNode ->
+            sceneView.removeChildNode(oldNode)
+            try { oldNode.destroy() } catch (_: Exception) {}
+        }
+        if (prismAnchor != null && prismAnchor != newAnchor) {
+            try { prismAnchor?.detach() } catch (_: Exception) {}
+        }
+
+        prismAnchor = newAnchor
+
+        val anchorNode = AnchorNode(engine = engine, anchor = newAnchor)
+        val yawNode = Node(engine).apply {
+            rotation = Rotation(0f, Math.toDegrees(initialAzimuth.toDouble()).toFloat(), 0f)
+        }
+        anchorNode.addChildNode(yawNode)
+        sceneView.addChildNode(anchorNode)
+
+        prismAnchorNode = anchorNode
+        prismYawNode = yawNode
+
+        rebuildPrismGpuMeshes()
+    }
+
+    /**
+     * Rebuilds the 9 capturable facets + structural grey frame + active 3D planar reticle
+     * on the GPU whenever prism dimensions change.
+     */
+    private fun rebuildPrismGpuMeshes() {
+        if (!gpuMaterialsReady) return
+        val yawNode = prismYawNode ?: return
+        val engine = sceneView.engine
+
+        clearPrismGpuMeshes()
+
+        val hW = prismWidth / 2f
+        val hD = prismDepth / 2f
+        val r = min(hW, hD) * 0.36f
+        val hMid = prismHeight * 0.50f
+        val tan30 = tan(Math.toRadians(30.0)).toFloat()
+        val dChamfer = min((prismHeight - hMid) * tan30, r * 0.82f)
+        val rTop = max(r - dChamfer * 0.45f, 0.015f)
+
+        val baseLoop = generateFilletedSquircleLoop(hW, hD, r)
+        val midLoop = generateFilletedSquircleLoop(hW, hD, r)
+        val topLoop = generateFilletedSquircleLoop(hW - dChamfer, hD - dChamfer, rTop)
+
+        val wireThickActive = 0.0016f
+        val wireThickStruct = 0.0011f
+
+        val structFaceBuilder = GpuMeshBuilder()
+        val structWireBuilder = GpuMeshBuilder()
+
+        // Lower tier (y = 0..hMid): 4 straight walls (facets 0, 2, 4, 6) + 4 structural corners
+        for (sector in 0 until 4) {
+            val facetIdx = sector * 2
+            val faceB = GpuMeshBuilder()
+            val wireB = GpuMeshBuilder()
+
+            val i0 = sector * 6
+            val i1 = (i0 + 1) % baseLoop.size
+            val p0 = floatArrayOf(baseLoop[i0][0], 0f, baseLoop[i0][2])
+            val p1 = floatArrayOf(baseLoop[i1][0], 0f, baseLoop[i1][2])
+            val p2 = floatArrayOf(midLoop[i1][0], hMid, midLoop[i1][2])
+            val p3 = floatArrayOf(midLoop[i0][0], hMid, midLoop[i0][2])
+
+            faceB.addDoubleSidedQuad(p0, p1, p2, p3)
+            wireB.addCrossedBeam(p0, p1, wireThickActive)
+            wireB.addCrossedBeam(p1, p2, wireThickActive)
+            wireB.addCrossedBeam(p2, p3, wireThickActive)
+            wireB.addCrossedBeam(p3, p0, wireThickActive)
+
+            val (fNode, fBufs) = faceB.buildMeshNode(engine, matRedFace)
+            val (wNode, wBufs) = wireB.buildMeshNode(engine, matRedWire)
+            yawNode.addChildNode(fNode)
+            yawNode.addChildNode(wNode)
+            facetFaceNodes[facetIdx] = fNode
+            facetWireNodes[facetIdx] = wNode
+            prismBuffers.add(fBufs)
+            prismBuffers.add(wBufs)
+
+            // Structural lower filleted corner
+            val startIdx = sector * 6 + 1
+            for (step in 0 until 5) {
+                val iA = (startIdx + step) % baseLoop.size
+                val iB = (startIdx + step + 1) % baseLoop.size
+                val c0 = floatArrayOf(baseLoop[iA][0], 0f, baseLoop[iA][2])
+                val c1 = floatArrayOf(baseLoop[iB][0], 0f, baseLoop[iB][2])
+                val c2 = floatArrayOf(midLoop[iB][0], hMid, midLoop[iB][2])
+                val c3 = floatArrayOf(midLoop[iA][0], hMid, midLoop[iA][2])
+                structFaceBuilder.addDoubleSidedQuad(c0, c1, c2, c3)
+                structWireBuilder.addCrossedBeam(c0, c1, wireThickStruct)
+                structWireBuilder.addCrossedBeam(c2, c3, wireThickStruct)
+            }
+        }
+
+        // Upper chamfer tier (y = hMid..prismHeight): 4 structural beveled walls + 4 chamfer corners (facets 1, 3, 5, 7)
+        for (sector in 0 until 4) {
+            val i0 = sector * 6
+            val i1 = (i0 + 1) % midLoop.size
+            val s0 = floatArrayOf(midLoop[i0][0], hMid, midLoop[i0][2])
+            val s1 = floatArrayOf(midLoop[i1][0], hMid, midLoop[i1][2])
+            val s2 = floatArrayOf(topLoop[i1][0], prismHeight, topLoop[i1][2])
+            val s3 = floatArrayOf(topLoop[i0][0], prismHeight, topLoop[i0][2])
+            structFaceBuilder.addDoubleSidedQuad(s0, s1, s2, s3)
+            structWireBuilder.addCrossedBeam(s0, s1, wireThickStruct)
+            structWireBuilder.addCrossedBeam(s2, s3, wireThickStruct)
+            structWireBuilder.addCrossedBeam(s0, s3, wireThickStruct)
+            structWireBuilder.addCrossedBeam(s1, s2, wireThickStruct)
+
+            val facetIdx = sector * 2 + 1
+            val faceB = GpuMeshBuilder()
+            val wireB = GpuMeshBuilder()
+            val startIdx = sector * 6 + 1
+
+            for (step in 0 until 5) {
+                val iA = (startIdx + step) % midLoop.size
+                val iB = (startIdx + step + 1) % midLoop.size
+                val c0 = floatArrayOf(midLoop[iA][0], hMid, midLoop[iA][2])
+                val c1 = floatArrayOf(midLoop[iB][0], hMid, midLoop[iB][2])
+                val c2 = floatArrayOf(topLoop[iB][0], prismHeight, topLoop[iB][2])
+                val c3 = floatArrayOf(topLoop[iA][0], prismHeight, topLoop[iA][2])
+                faceB.addDoubleSidedQuad(c0, c1, c2, c3)
+                wireB.addCrossedBeam(c0, c1, wireThickActive)
+                wireB.addCrossedBeam(c2, c3, wireThickActive)
+                if (step == 0) wireB.addCrossedBeam(c0, c3, wireThickActive)
+                if (step == 4) wireB.addCrossedBeam(c1, c2, wireThickActive)
+            }
+
+            val (fNode, fBufs) = faceB.buildMeshNode(engine, matRedFace)
+            val (wNode, wBufs) = wireB.buildMeshNode(engine, matRedWire)
+            yawNode.addChildNode(fNode)
+            yawNode.addChildNode(wNode)
+            facetFaceNodes[facetIdx] = fNode
+            facetWireNodes[facetIdx] = wNode
+            prismBuffers.add(fBufs)
+            prismBuffers.add(wBufs)
+        }
+
+        // Top Cap (facet 8)
+        val topFaceB = GpuMeshBuilder()
+        val topWireB = GpuMeshBuilder()
+        val topRing3D = topLoop.map { floatArrayOf(it[0], prismHeight, it[2]) }
+        topFaceB.addDoubleSidedConvexPolygon(topRing3D)
+        for (i in topRing3D.indices) {
+            val next = (i + 1) % topRing3D.size
+            topWireB.addCrossedBeam(topRing3D[i], topRing3D[next], wireThickActive)
+        }
+        val (topFNode, topFBufs) = topFaceB.buildMeshNode(engine, matRedFace)
+        val (topWNode, topWBufs) = topWireB.buildMeshNode(engine, matRedWire)
+        yawNode.addChildNode(topFNode)
+        yawNode.addChildNode(topWNode)
+        facetFaceNodes[8] = topFNode
+        facetWireNodes[8] = topWNode
+        prismBuffers.add(topFBufs)
+        prismBuffers.add(topWBufs)
+
+        // Structural combined grey node
+        val (stFNode, stFBufs) = structFaceBuilder.buildMeshNode(engine, matGreyFace)
+        val (stWNode, stWBufs) = structWireBuilder.buildMeshNode(engine, matGreyWire)
+        yawNode.addChildNode(stFNode)
+        yawNode.addChildNode(stWNode)
+        structuralFaceNode = stFNode
+        structuralWireNode = stWNode
+        prismBuffers.add(stFBufs)
+        prismBuffers.add(stWBufs)
+
+        reticleBuiltForStep = -1
+        lastVisualStepIdx = -1
+        updateGpuFacetMaterialsAndReticle(isAlignedNow = false, forceUpdate = true)
+    }
+
+    private fun clearPrismGpuMeshes() {
+        val engine = sceneView.engine
+        val yawNode = prismYawNode
+
+        for (i in 0 until 9) {
+            facetFaceNodes[i]?.let { yawNode?.removeChildNode(it); try { it.destroy() } catch (_: Exception) {} }
+            facetWireNodes[i]?.let { yawNode?.removeChildNode(it); try { it.destroy() } catch (_: Exception) {} }
+            facetFaceNodes[i] = null
+            facetWireNodes[i] = null
+        }
+        structuralFaceNode?.let { yawNode?.removeChildNode(it); try { it.destroy() } catch (_: Exception) {} }
+        structuralWireNode?.let { yawNode?.removeChildNode(it); try { it.destroy() } catch (_: Exception) {} }
+        structuralFaceNode = null
+        structuralWireNode = null
+
+        clearReticleGpuNode()
+
+        for ((vb, ib) in prismBuffers) {
+            try { engine.destroyVertexBuffer(vb) } catch (_: Exception) {}
+            try { engine.destroyIndexBuffer(ib) } catch (_: Exception) {}
+        }
+        prismBuffers.clear()
+    }
+
+    private fun clearReticleGpuNode() {
+        val engine = sceneView.engine
+        activeReticleNode?.let {
+            prismYawNode?.removeChildNode(it)
+            try { it.destroy() } catch (_: Exception) {}
+        }
+        activeReticleNode = null
+        reticleBuffers?.let { (vb, ib) ->
+            try { engine.destroyVertexBuffer(vb) } catch (_: Exception) {}
+            try { engine.destroyIndexBuffer(ib) } catch (_: Exception) {}
+        }
+        reticleBuffers = null
+        reticleBuiltForStep = -1
+    }
+
+    /**
+     * O(1) GPU material state update for all 9 facets + active 3D planar bullseye reticle.
+     */
+    private fun updateGpuFacetMaterialsAndReticle(isAlignedNow: Boolean, forceUpdate: Boolean = false) {
+        if (!gpuMaterialsReady || prismYawNode == null) return
+        if (!forceUpdate && currentStepIdx == lastVisualStepIdx && isAlignedNow == lastReticleAlignedState) return
+
+        for (i in 0 until 9) {
+            val isCaptured = capturedThumbnails.containsKey(i)
+            val isActive = (currentStepIdx == i)
+            val useGreen = isCaptured || (isActive && isAlignedNow)
+            setNodeMaterial(facetFaceNodes[i], if (useGreen) matGreenFace else matRedFace)
+            setNodeMaterial(facetWireNodes[i], if (useGreen) matGreenWire else matRedWire)
+        }
+
+        if (currentStepIdx >= sequence.size) {
+            clearReticleGpuNode()
+        } else {
+            if (reticleBuiltForStep != currentStepIdx) {
+                rebuildActiveReticleMesh(currentStepIdx)
+            }
+            setNodeMaterial(activeReticleNode, if (isAlignedNow) matGreenWire else matRedWire)
+        }
+
+        lastVisualStepIdx = currentStepIdx
+        lastReticleAlignedState = isAlignedNow
+    }
+
+    private fun rebuildActiveReticleMesh(step: Int) {
+        val yawNode = prismYawNode ?: return
+        val engine = sceneView.engine
+        clearReticleGpuNode()
+
+        val desc = getFacetDescriptor(step)
+        val nx = desc.normX; val ny = desc.normY; val nz = desc.normZ
+        val ux: Float; val uy: Float; val uz: Float
+
+        if (abs(ny) > 0.95f) {
+            ux = 1f; uy = 0f; uz = 0f
+        } else {
+            val len = sqrt(nz * nz + nx * nx)
+            ux = nz / len; uy = 0f; uz = -nx / len
+        }
+        val vx = ny * uz - nz * uy
+        val vy = nz * ux - nx * uz
+        val vz = nx * uy - ny * ux
+
+        val radius = min(prismWidth, prismDepth) * 0.21f
+        val lift = 0.0035f
+        val cx = desc.centerX + nx * lift
+        val cy = desc.centerY + ny * lift
+        val cz = desc.centerZ + nz * lift
+
+        val builder = GpuMeshBuilder()
+        val ringSteps = 20
+        val ringPts = Array(ringSteps) { i ->
+            val ang = (2.0 * Math.PI * i / ringSteps).toFloat()
+            val c = cos(ang); val s = sin(ang)
+            floatArrayOf(
+                cx + radius * (c * ux + s * vx),
+                cy + radius * (c * uy + s * vy),
+                cz + radius * (c * uz + s * vz)
+            )
+        }
+
+        val beamThick = 0.0018f
+        for (i in 0 until ringSteps) {
+            val next = (i + 1) % ringSteps
+            builder.addCrossedBeam(ringPts[i], ringPts[next], beamThick)
+        }
+
+        // Crosshair ticks
+        val ch = radius * 1.40f
+        builder.addCrossedBeam(
+            floatArrayOf(cx - ux * ch, cy - uy * ch, cz - uz * ch),
+            floatArrayOf(cx + ux * ch, cy + uy * ch, cz + uz * ch),
+            beamThick
+        )
+        builder.addCrossedBeam(
+            floatArrayOf(cx - vx * ch * 0.6f, cy - vy * ch * 0.6f, cz - vz * ch * 0.6f),
+            floatArrayOf(cx + vx * ch * 0.6f, cy + vy * ch * 0.6f, cz + vz * ch * 0.6f),
+            beamThick * 0.85f
+        )
+
+        // Center bullseye dot disc
+        val dotR = (radius * 0.28f).coerceIn(0.003f, 0.009f)
+        val dotPts = (0 until 12).map { i ->
+            val ang = (2.0 * Math.PI * i / 12).toFloat()
+            val c = cos(ang); val s = sin(ang)
+            floatArrayOf(
+                cx + dotR * (c * ux + s * vx),
+                cy + dotR * (c * uy + s * vy),
+                cz + dotR * (c * uz + s * vz)
+            )
+        }
+        builder.addDoubleSidedConvexPolygon(dotPts)
+
+        val (rNode, rBufs) = builder.buildMeshNode(engine, matRedWire)
+        yawNode.addChildNode(rNode)
+        activeReticleNode = rNode
+        reticleBuffers = rBufs
+        reticleBuiltForStep = step
+    }
+
+    /**
+     * Helper that builds double-sided Filament VertexBuffer/IndexBuffer geometry
+     * with valid POSITION (FLOAT3) and TANGENTS (FLOAT4 quaternion) attributes.
+     */
+    private class GpuMeshBuilder {
+        private val positions = mutableListOf<Float>()
+        private val tangents = mutableListOf<Float>()
+        private val indices = mutableListOf<Short>()
+
+        private fun normalToQuaternion(nx: Float, ny: Float, nz: Float): FloatArray {
+            val len = sqrt(nx * nx + ny * ny + nz * nz)
+            if (len < 1e-6f) return floatArrayOf(0f, 0f, 0f, 1f)
+            val x = nx / len; val y = ny / len; val z = nz / len
+            if (z < -0.999f) return floatArrayOf(0f, 1f, 0f, 0f)
+            val qx = -y
+            val qy = x
+            val qz = 0f
+            val qw = 1f + z
+            val qLen = sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+            return floatArrayOf(qx / qLen, qy / qLen, qz / qLen, qw / qLen)
+        }
+
+        private fun addVertex(p: FloatArray, q: FloatArray): Short {
+            val idx = (positions.size / 3).toShort()
+            positions.add(p[0]); positions.add(p[1]); positions.add(p[2])
+            tangents.add(q[0]); tangents.add(q[1]); tangents.add(q[2]); tangents.add(q[3])
+            return idx
+        }
+
+        fun addDoubleSidedQuad(p0: FloatArray, p1: FloatArray, p2: FloatArray, p3: FloatArray) {
+            val e1x = p1[0] - p0[0]; val e1y = p1[1] - p0[1]; val e1z = p1[2] - p0[2]
+            val e2x = p2[0] - p0[0]; val e2y = p2[1] - p0[1]; val e2z = p2[2] - p0[2]
+            val nx = e1y * e2z - e1z * e2y
+            val ny = e1z * e2x - e1x * e2z
+            val nz = e1x * e2y - e1y * e2x
+
+            val qF = normalToQuaternion(nx, ny, nz)
+            val f0 = addVertex(p0, qF); val f1 = addVertex(p1, qF)
+            val f2 = addVertex(p2, qF); val f3 = addVertex(p3, qF)
+            indices.add(f0); indices.add(f1); indices.add(f2)
+            indices.add(f0); indices.add(f2); indices.add(f3)
+
+            val qB = normalToQuaternion(-nx, -ny, -nz)
+            val b0 = addVertex(p0, qB); val b1 = addVertex(p1, qB)
+            val b2 = addVertex(p2, qB); val b3 = addVertex(p3, qB)
+            indices.add(b0); indices.add(b2); indices.add(b1)
+            indices.add(b0); indices.add(b3); indices.add(b2)
+        }
+
+        fun addDoubleSidedConvexPolygon(pts: List<FloatArray>) {
+            if (pts.size < 3) return
+            var cx = 0f; var cy = 0f; var cz = 0f
+            for (p in pts) { cx += p[0]; cy += p[1]; cz += p[2] }
+            val center = floatArrayOf(cx / pts.size, cy / pts.size, cz / pts.size)
+
+            val e1x = pts[1][0] - pts[0][0]; val e1y = pts[1][1] - pts[0][1]; val e1z = pts[1][2] - pts[0][2]
+            val e2x = pts[2][0] - pts[0][0]; val e2y = pts[2][1] - pts[0][1]; val e2z = pts[2][2] - pts[0][2]
+            val nx = e1y * e2z - e1z * e2y
+            val ny = e1z * e2x - e1x * e2z
+            val nz = e1x * e2y - e1y * e2x
+
+            val qF = normalToQuaternion(nx, ny, nz)
+            val qB = normalToQuaternion(-nx, -ny, -nz)
+
+            val fCenter = addVertex(center, qF)
+            val fRing = pts.map { addVertex(it, qF) }
+            for (i in pts.indices) {
+                val next = (i + 1) % pts.size
+                indices.add(fCenter); indices.add(fRing[i]); indices.add(fRing[next])
+            }
+
+            val bCenter = addVertex(center, qB)
+            val bRing = pts.map { addVertex(it, qB) }
+            for (i in pts.indices) {
+                val next = (i + 1) % pts.size
+                indices.add(bCenter); indices.add(bRing[next]); indices.add(bRing[i])
+            }
+        }
+
+        /**
+         * Builds a crisp 3D crossed-ribbon beam between a and b so wireframe lines
+         * remain solid and thick from every 3D viewing angle on mobile GPUs.
+         */
+        fun addCrossedBeam(a: FloatArray, b: FloatArray, halfThick: Float) {
+            val dx = b[0] - a[0]; val dy = b[1] - a[1]; val dz = b[2] - a[2]
+            val len = sqrt(dx * dx + dy * dy + dz * dz)
+            if (len < 1e-5f) return
+            val tx = dx / len; val ty = dy / len; val tz = dz / len
+
+            // Pick a reference vector not parallel to tangent
+            val rx: Float; val ry: Float; val rz: Float
+            if (abs(ty) < 0.9f) {
+                rx = 0f; ry = 1f; rz = 0f
+            } else {
+                rx = 1f; ry = 0f; rz = 0f
+            }
+
+            // First orthogonal axis u = normalize(t x r)
+            var ux = ty * rz - tz * ry
+            var uy = tz * rx - tx * rz
+            var uz = tx * ry - ty * rx
+            val uLen = sqrt(ux * ux + uy * uy + uz * uz).coerceAtLeast(1e-5f)
+            ux = (ux / uLen) * halfThick; uy = (uy / uLen) * halfThick; uz = (uz / uLen) * halfThick
+
+            // Second orthogonal axis v = normalize(t x u)
+            var vx = ty * uz - tz * uy
+            var vy = tz * ux - tx * uz
+            var vz = tx * uy - ty * ux
+            val vLen = sqrt(vx * vx + vy * vy + vz * vz).coerceAtLeast(1e-5f)
+            vx = (vx / vLen) * halfThick; vy = (vy / vLen) * halfThick; vz = (vz / vLen) * halfThick
+
+            // Ribbon 1 along u
+            addDoubleSidedQuad(
+                floatArrayOf(a[0] - ux, a[1] - uy, a[2] - uz),
+                floatArrayOf(a[0] + ux, a[1] + uy, a[2] + uz),
+                floatArrayOf(b[0] + ux, b[1] + uy, b[2] + uz),
+                floatArrayOf(b[0] - ux, b[1] - uy, b[2] - uz)
+            )
+            // Ribbon 2 along v
+            addDoubleSidedQuad(
+                floatArrayOf(a[0] - vx, a[1] - vy, a[2] - vz),
+                floatArrayOf(a[0] + vx, a[1] + vy, a[2] + vz),
+                floatArrayOf(b[0] + vx, b[1] + vy, b[2] + vz),
+                floatArrayOf(b[0] - vx, b[1] - vy, b[2] - vz)
+            )
+        }
+
+        fun buildMeshNode(engine: Engine, material: MaterialInstance): Pair<MeshNode, Pair<VertexBuffer, IndexBuffer>> {
+            val vCount = max(1, positions.size / 3)
+            val iCount = max(3, indices.size)
+
+            val posBuf = ByteBuffer.allocateDirect(vCount * 3 * 4).order(ByteOrder.nativeOrder())
+            for (v in positions) posBuf.putFloat(v)
+            while (posBuf.hasRemaining()) posBuf.putFloat(0f)
+            posBuf.rewind()
+
+            val tanBuf = ByteBuffer.allocateDirect(vCount * 4 * 4).order(ByteOrder.nativeOrder())
+            for (v in tangents) tanBuf.putFloat(v)
+            while (tanBuf.hasRemaining()) tanBuf.putFloat(1f)
+            tanBuf.rewind()
+
+            val idxBuf = ByteBuffer.allocateDirect(iCount * 2).order(ByteOrder.nativeOrder())
+            for (idx in indices) idxBuf.putShort(idx)
+            while (idxBuf.hasRemaining()) idxBuf.putShort(0)
+            idxBuf.rewind()
+
+            val vb = VertexBuffer.Builder()
+                .bufferCount(2)
+                .vertexCount(vCount)
+                .attribute(VertexBuffer.VertexAttribute.POSITION, 0, VertexBuffer.AttributeType.FLOAT3)
+                .attribute(VertexBuffer.VertexAttribute.TANGENTS, 1, VertexBuffer.AttributeType.FLOAT4)
+                .build(engine)
+            vb.setBufferAt(engine, 0, posBuf)
+            vb.setBufferAt(engine, 1, tanBuf)
+
+            val ib = IndexBuffer.Builder()
+                .indexCount(iCount)
+                .bufferType(IndexBuffer.Builder.IndexType.USHORT)
+                .build(engine)
+            ib.setBuffer(engine, idxBuf)
+
+            val node = MeshNode(
+                engine = engine,
+                primitiveType = RenderableManager.PrimitiveType.TRIANGLES,
+                vertexBuffer = vb,
+                indexBuffer = ib,
+                materialInstance = material,
+                builder = {
+                    boundingBox(Box(0f, 0.2f, 0f, 1.5f, 1.5f, 1.5f))
+                    culling(false)
+                    castShadows(false)
+                    receiveShadows(false)
+                }
+            )
+            return Pair(node, Pair(vb, ib))
+        }
+    }
+
+    private fun generateFilletedSquircleLoop(hW: Float, hD: Float, r: Float): List<FloatArray> {
+        val loop = mutableListOf<FloatArray>()
+        val xS = hW - r
+        val zS = hD - r
+
+        for (quad in 0 until 4) {
+            when (quad) {
+                0 -> { loop.add(floatArrayOf(-xS, 0f, hD)); loop.add(floatArrayOf(xS, 0f, hD)) }
+                1 -> { loop.add(floatArrayOf(hW, 0f, zS)); loop.add(floatArrayOf(hW, 0f, -zS)) }
+                2 -> { loop.add(floatArrayOf(xS, 0f, -hD)); loop.add(floatArrayOf(-xS, 0f, -hD)) }
+                3 -> { loop.add(floatArrayOf(-hW, 0f, -zS)); loop.add(floatArrayOf(-hW, 0f, zS)) }
+            }
+
+            val cX = if (quad == 0 || quad == 1) xS else -xS
+            val cZ = if (quad == 0 || quad == 3) zS else -zS
+            val startAngle = Math.toRadians((90.0 - quad * 90.0))
+
+            for (step in 1..4) {
+                val angle = startAngle - (Math.PI / 2.0) * (step / 5.0)
+                val px = cX + r * cos(angle).toFloat()
+                val pz = cZ + r * sin(angle).toFloat()
+                loop.add(floatArrayOf(px, 0f, pz))
+            }
+        }
+        return loop
+    }
+
+    // =========================================================================
+    // TFLITE MAGICTOUCH INITIALIZATION & THUMBNAIL STRIP
+    // =========================================================================
     private fun initMagicTouchTFLite() {
         Thread {
             try {
@@ -310,7 +1062,7 @@ class MainActivity : AppCompatActivity() {
 
                 val inShape = interp.getInputTensor(0).shape()
                 val outShape = interp.getOutputTensor(0).shape()
-                logDebug("✓ MagicTouch Ready!\nIn: ${inShape.contentToString()} (${interp.getInputTensor(0).dataType()})\nOut: ${outShape.contentToString()} (${interp.getOutputTensor(0).dataType()})")
+                logDebug("✓ MagicTouch Ready! In:${inShape.contentToString()} Out:${outShape.contentToString()}")
             } catch (e: Exception) {
                 logDebug("❌ MagicTouch Load Failed: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -375,7 +1127,7 @@ class MainActivity : AppCompatActivity() {
         prismDepth = (prismDepth * factor).coerceIn(0.04f, 0.50f)
         prismHeight = (prismHeight * factor).coerceIn(0.02f, 0.40f)
         updateScaleLabels()
-        overlayView.postInvalidate()
+        rebuildPrismGpuMeshes()
     }
 
     private fun updateScaleLabels() {
@@ -406,7 +1158,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // PHASE 1: OUTSIDE-IN SILHOUETTE DETECTOR & 3D ENCAPSULATING RING (PRE-LOCK)
+    // PHASE 1: OUTSIDE-IN SILHOUETTE DETECTOR & GPU 3D ENCAPSULATING RING
     // =========================================================================
     private fun updateLiveClingReticle(frame: Frame, planeHitPose: Pose) {
         val sWidth = sceneView.width.toFloat()
@@ -902,11 +1654,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // PHASE 2: LOCK HANDOFF + MAGICTOUCH TFLITE INTERPRETER REFINEMENT
+    // PHASE 2: PLANE-ATTACHED ANCHOR LOCK + CLEAN MAGICTOUCH REFINEMENT
     // =========================================================================
+    private fun getActiveRootPlane(): Plane? {
+        var p = trackedTablePlane
+        while (p?.subsumedBy != null) {
+            p = p.subsumedBy
+        }
+        if (p != null && p.trackingState == TrackingState.TRACKING) {
+            trackedTablePlane = p
+            return p
+        }
+        return null
+    }
+
+    /**
+     * Creates a strictly gravity-aligned (Y-up [0,0,0,1]) anchor attached directly
+     * to the tracked horizontal table Plane whenever available so vibration recovery
+     * keeps the prism glued to the table's visual map.
+     */
+    private fun createPlaneGroundedAnchor(x: Float, y: Float, z: Float): Anchor? {
+        val gravityUpPose = Pose(floatArrayOf(x, y, z), floatArrayOf(0f, 0f, 0f, 1f))
+        val rootPlane = getActiveRootPlane()
+        if (rootPlane != null) {
+            try {
+                val planePose = Pose(
+                    floatArrayOf(x, rootPlane.centerPose.ty(), z),
+                    floatArrayOf(0f, 0f, 0f, 1f)
+                )
+                return rootPlane.createAnchor(planePose)
+            } catch (_: Exception) {}
+        }
+        return try {
+            sceneView.session?.createAnchor(gravityUpPose)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
-        val session = sceneView.session ?: return
         val hitResults = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
         val planeHit = hitResults.firstOrNull {
             val t = it.trackable
@@ -915,59 +1702,63 @@ class MainActivity : AppCompatActivity() {
         val firstHit = planeHit ?: hitResults.firstOrNull()
 
         if (firstHit != null) {
+            if (planeHit != null) {
+                trackedTablePlane = planeHit.trackable as Plane
+            }
             val hitPose = firstHit.hitPose
             val seedScreenX: Float
             val seedScreenY: Float
+            val anchor: Anchor?
 
             if (hasLiveCling) {
-                val clingPose = Pose(
-                    floatArrayOf(liveWorldX, liveWorldY, liveWorldZ),
-                    hitPose.rotationQuaternion
-                )
-                prismAnchor = session.createAnchor(clingPose)
+                anchor = createPlaneGroundedAnchor(liveWorldX, liveWorldY, liveWorldZ)
                 prismWidth = liveWidth
                 prismDepth = liveDepth
                 prismHeight = liveHeight
                 initialAzimuth = liveAzimuth
                 seedScreenX = liveClingScreenX
                 seedScreenY = liveClingScreenY
-
-                val wCm = (prismWidth * 100).roundToInt()
-                val dCm = (prismDepth * 100).roundToInt()
-                val hCm = (prismHeight * 100).roundToInt()
-                logDebug("✓ Locked 3D Ring Seed: ${wCm}x${dCm}x${hCm}cm")
             } else {
-                val anchor = firstHit.createAnchor()
-                prismAnchor = anchor
+                anchor = createPlaneGroundedAnchor(hitPose.tx(), hitPose.ty(), hitPose.tz())
                 val camPose = frame.camera.pose
-                val anchorPose = anchor.pose
-                val camInAnchor = anchorPose.inverse().transformPoint(floatArrayOf(camPose.tx(), camPose.ty(), camPose.tz()))
-                initialAzimuth = atan2(camInAnchor[0], camInAnchor[2])
+                initialAzimuth = atan2(camPose.tx() - hitPose.tx(), camPose.tz() - hitPose.tz())
                 seedScreenX = sceneView.width / 2f
                 seedScreenY = sceneView.height / 2f
             }
 
+            if (anchor == null) {
+                Toast.makeText(this, "Tracking not ready — move slightly", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            // Hide the pre-lock GPU ring immediately
+            liveRingRoot?.isVisible = false
             isBoxPlaced = true
 
-            val currentAnchor = prismAnchor
-            if (currentAnchor != null) {
-                val vMat = FloatArray(16)
-                val pMat = FloatArray(16)
-                val vpMat = FloatArray(16)
-                val invVpMat = FloatArray(16)
+            // Snapshot VP matrix before spawning prism so MagicTouch gets a clean, overlay-free frame
+            val vMat = FloatArray(16)
+            val pMat = FloatArray(16)
+            val vpMat = FloatArray(16)
+            val invVpMat = FloatArray(16)
 
-                frame.camera.getViewMatrix(vMat, 0)
-                frame.camera.getProjectionMatrix(pMat, 0, 0.05f, 50.0f)
-                Matrix.multiplyMM(vpMat, 0, pMat, 0, vMat, 0)
-                Matrix.invertM(invVpMat, 0, vpMat, 0)
+            frame.camera.getViewMatrix(vMat, 0)
+            frame.camera.getProjectionMatrix(pMat, 0, 0.05f, 50.0f)
+            Matrix.multiplyMM(vpMat, 0, pMat, 0, vMat, 0)
+            Matrix.invertM(invVpMat, 0, vpMat, 0)
 
-                val snapshotAnchorPose = currentAnchor.pose
-                val camPose = frame.camera.pose
-                val camInAnchor = snapshotAnchorPose.inverse().transformPoint(
-                    floatArrayOf(camPose.tx(), camPose.ty(), camPose.tz())
-                )
-                val camAngle = atan2(camInAnchor[0], camInAnchor[2])
+            val snapshotAnchorPose = anchor.pose
+            val camPose = frame.camera.pose
+            val camInAnchor = snapshotAnchorPose.inverse().transformPoint(
+                floatArrayOf(camPose.tx(), camPose.ty(), camPose.tz())
+            )
+            val camAngle = atan2(camInAnchor[0], camInAnchor[2])
 
+            attachPrismToAnchor(anchor)
+
+            // Briefly hide the new GPU prism for 2 frames (45ms) so MagicTouch receives a clean camera image
+            isTakingCleanSnapshot = true
+            prismAnchorNode?.isVisible = false
+            mainHandler.postDelayed({
                 runMagicTouchPipeline(
                     invVpMat,
                     snapshotAnchorPose,
@@ -976,7 +1767,7 @@ class MainActivity : AppCompatActivity() {
                     seedScreenY,
                     prismHeight
                 )
-            }
+            }, 45L)
 
             actionButton.visibility = View.GONE
             scaleBar.visibility = View.VISIBLE
@@ -986,6 +1777,7 @@ class MainActivity : AppCompatActivity() {
             targetBadge.text = sequence[currentStepIdx].label
             updateChecklistUI()
             updateScaleLabels()
+            overlayView.showCrosshair = true
             overlayView.postInvalidate()
 
             try {
@@ -996,11 +1788,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Runs magic_touch.tflite directly through org.tensorflow.lite.Interpreter:
-     * Feeds RGB + 4th-channel Gaussian point-prompt heatmap centered at (normKeyX, normKeyY),
-     * extracts the neural segmentation mask, and refines the 3D bounding prism.
-     */
     private fun runMagicTouchPipeline(
         invVpMatrix: FloatArray,
         snapshotAnchorPose: Pose,
@@ -1011,26 +1798,33 @@ class MainActivity : AppCompatActivity() {
     ) {
         val sWidth = sceneView.width
         val sHeight = sceneView.height
-        if (sWidth <= 0 || sHeight <= 0) return
+        if (sWidth <= 0 || sHeight <= 0) {
+            isTakingCleanSnapshot = false
+            prismAnchorNode?.isVisible = true
+            return
+        }
 
         val bitmap = Bitmap.createBitmap(sWidth, sHeight, Bitmap.Config.ARGB_8888)
         PixelCopy.request(
             sceneView as SurfaceView,
             bitmap,
             PixelCopy.OnPixelCopyFinishedListener { copyResult ->
+                // Restore GPU prism immediately once clean frame is grabbed
+                isTakingCleanSnapshot = false
+                prismAnchorNode?.isVisible = true
+
                 if (copyResult == PixelCopy.SUCCESS) {
                     Thread {
                         val interp = tfliteInterpreter
                         if (interp == null) {
-                            logDebug("⚠️ MagicTouch TFLite not ready — keeping 3D Ring lock")
+                            logDebug("⚠️ MagicTouch TFLite not ready — keeping GPU 3D Ring lock")
                             return@Thread
                         }
 
                         try {
                             val startMs = System.currentTimeMillis()
-
                             val inTensor = interp.getInputTensor(0)
-                            val inShape = inTensor.shape() // Typically [1, 512, 512, 4]
+                            val inShape = inTensor.shape()
                             val inType = inTensor.dataType()
                             val inH = if (inShape.size >= 3) inShape[1] else 512
                             val inW = if (inShape.size >= 3) inShape[2] else 512
@@ -1039,13 +1833,7 @@ class MainActivity : AppCompatActivity() {
                             val minDim = min(bitmap.width, bitmap.height)
                             val cropX = (bitmap.width - minDim) / 2f
                             val cropY = (bitmap.height - minDim) / 2f
-                            val squareBmp = Bitmap.createBitmap(
-                                bitmap,
-                                cropX.toInt(),
-                                cropY.toInt(),
-                                minDim,
-                                minDim
-                            )
+                            val squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
                             val scaledBmp = Bitmap.createScaledBitmap(squareBmp, inW, inH, true)
 
                             val normKeyX = ((seedScreenX - cropX) / minDim).coerceIn(0.15f, 0.85f)
@@ -1102,20 +1890,11 @@ class MainActivity : AppCompatActivity() {
                             logDebug("MagicTouch TFLite: ${latencyMs}ms | Out:${outShape.contentToString()}")
 
                             projectMagicTouchBufferAndOrient(
-                                outputBuffer,
-                                outShape,
-                                outType,
-                                cropX,
-                                cropY,
-                                minDim.toFloat(),
-                                normKeyX,
-                                normKeyY,
-                                invVpMatrix,
-                                snapshotAnchorPose,
-                                camAngle,
-                                seedHeightM,
-                                sWidth,
-                                sHeight
+                                outputBuffer, outShape, outType,
+                                cropX, cropY, minDim.toFloat(),
+                                normKeyX, normKeyY,
+                                invVpMatrix, snapshotAnchorPose,
+                                camAngle, seedHeightM, sWidth, sHeight
                             )
                         } catch (e: Exception) {
                             logDebug("❌ MagicTouch Exception: ${e.javaClass.simpleName}: ${e.message}")
@@ -1123,7 +1902,7 @@ class MainActivity : AppCompatActivity() {
                     }.start()
                 }
             },
-            Handler(Looper.getMainLooper())
+            mainHandler
         )
     }
 
@@ -1178,7 +1957,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Compare score around seed vs. outer border to calibrate threshold automatically
         val seedX = (normKeyX * mW).toInt().coerceIn(8, mW - 9)
         val seedY = (normKeyY * mH).toInt().coerceIn(8, mH - 9)
         var seedSum = 0f; var seedCnt = 0
@@ -1198,7 +1976,7 @@ class MainActivity : AppCompatActivity() {
         val borderMean = borderSum / borderCnt.coerceAtLeast(1)
 
         if (abs(seedMean - borderMean) < 0.04f) {
-            logDebug("ℹ️ MagicTouch low contrast — keeping 3D Ring lock")
+            logDebug("ℹ️ MagicTouch low contrast — keeping GPU 3D Ring lock")
             return
         }
 
@@ -1273,7 +2051,7 @@ class MainActivity : AppCompatActivity() {
 
         val count = fgScreenX.size
         if (count < 30 || count > (gSize * gSize * 0.72f).toInt()) {
-            logDebug("ℹ️ Keeping 3D Ring Fit (MagicTouch mask count: $count)")
+            logDebug("ℹ️ Keeping GPU 3D Ring Fit (MagicTouch mask count: $count)")
             return
         }
 
@@ -1410,41 +2188,36 @@ class MainActivity : AppCompatActivity() {
         }
 
         runOnUiThread {
-            try {
-                val session = sceneView.session
-                val currentAnchor = prismAnchor
-                if (session != null && currentAnchor != null) {
-                    val curPose = currentAnchor.pose
-                    val deltaX = (lCenter[0] * 0.5f).coerceIn(-0.06f, 0.06f)
-                    val deltaZ = (lCenter[2] * 0.5f).coerceIn(-0.06f, 0.06f)
-                    val worldCenterNow = curPose.transformPoint(floatArrayOf(deltaX, 0f, deltaZ))
-                    currentAnchor.detach()
-                    val newCenterPose = Pose(
-                        floatArrayOf(worldCenterNow[0], curPose.ty(), worldCenterNow[2]),
-                        curPose.rotationQuaternion
-                    )
-                    prismAnchor = session.createAnchor(newCenterPose)
-                }
-            } catch (e: Exception) {
-                logDebug("Re-anchor failed: ${e.message}")
-            }
-
             initialAzimuth = headingAngle
             prismWidth = finalWidth * 0.65f + prismWidth * 0.35f
             prismDepth = finalDepth * 0.65f + prismDepth * 0.35f
 
+            val currentAnchor = prismAnchor
+            if (currentAnchor != null) {
+                val curPose = currentAnchor.pose
+                val deltaX = (lCenter[0] * 0.5f).coerceIn(-0.06f, 0.06f)
+                val deltaZ = (lCenter[2] * 0.5f).coerceIn(-0.06f, 0.06f)
+                val worldCenterNow = curPose.transformPoint(floatArrayOf(deltaX, 0f, deltaZ))
+                val refinedAnchor = createPlaneGroundedAnchor(worldCenterNow[0], curPose.ty(), worldCenterNow[2])
+                if (refinedAnchor != null) {
+                    attachPrismToAnchor(refinedAnchor)
+                } else {
+                    syncPrismYawTransform()
+                    rebuildPrismGpuMeshes()
+                }
+            }
+
             updateScaleLabels()
-            overlayView.postInvalidate()
 
             val wCm = (prismWidth * 100).roundToInt()
             val dCm = (prismDepth * 100).roundToInt()
             val hCm = (prismHeight * 100).roundToInt()
             val yawDeg = Math.toDegrees(headingAngle.toDouble()).roundToInt()
 
-            logDebug("✓ MagicTouch Refined: ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
+            logDebug("✓ MagicTouch GPU Lock: ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
             Toast.makeText(
                 this@MainActivity,
-                "✓ MagicTouch Locked: ${wCm}×${dCm}×${hCm}cm",
+                "✓ MagicTouch GPU Locked: ${wCm}×${dCm}×${hCm}cm",
                 Toast.LENGTH_SHORT
             ).show()
         }
@@ -1492,9 +2265,15 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(rOx + t * dX, planeY, rOz + t * dZ)
     }
 
+    // =========================================================================
+    // PER-FRAME GPU SYNC & THROTTLED HUD TRACKING LOOP
+    // =========================================================================
     private fun onTrackingFrame(frame: Frame) {
         val camera = frame.camera
         if (camera.trackingState != TrackingState.TRACKING) return
+
+        val now = System.currentTimeMillis()
+        val shouldUpdateHud = (now - lastHudUpdateMs) >= 100L
 
         if (!isBoxPlaced) {
             val hitResults = frame.hitTest(sceneView.width / 2f, sceneView.height / 2f)
@@ -1505,6 +2284,9 @@ class MainActivity : AppCompatActivity() {
             val hit = planeHit ?: hitResults.firstOrNull()
 
             if (hit != null) {
+                if (planeHit != null) {
+                    trackedTablePlane = planeHit.trackable as Plane
+                }
                 frameCounter++
                 if (frameCounter % 2 == 0) {
                     updateLiveClingReticle(frame, hit.hitPose)
@@ -1514,7 +2296,42 @@ class MainActivity : AppCompatActivity() {
                 liveClingConfidence = 0
             }
 
-            runOnUiThread {
+            // Update GPU 3D Volumetric Ring transform directly on the render frame (0 ms lag!)
+            if (gpuMaterialsReady) {
+                val ring = liveRingRoot
+                if (ring != null) {
+                    if (hasLiveCling) {
+                        val rx = (liveWidth * 0.68f).coerceIn(0.032f, 0.26f)
+                        val rz = (liveDepth * 0.68f).coerceIn(0.032f, 0.26f)
+                        val ringH = liveHeight.coerceIn(0.032f, 0.22f)
+                        ring.isVisible = true
+                        ring.position = Position(liveWorldX, liveWorldY, liveWorldZ)
+                        ring.rotation = Rotation(0f, Math.toDegrees(liveAzimuth.toDouble()).toFloat(), 0f)
+                        ring.scale = Scale(rx, ringH, rz)
+                        if (!liveRingIsClingColor) {
+                            setNodeMaterial(liveRingWallNode, matRingClingWall)
+                            setNodeMaterial(liveRingWireNode, matRingClingWire)
+                            liveRingIsClingColor = true
+                        }
+                    } else if (hit != null) {
+                        val hp = hit.hitPose
+                        ring.isVisible = true
+                        ring.position = Position(hp.tx(), hp.ty(), hp.tz())
+                        ring.rotation = Rotation(0f, 0f, 0f)
+                        ring.scale = Scale(0.075f, 0.035f, 0.075f)
+                        if (liveRingIsClingColor) {
+                            setNodeMaterial(liveRingWallNode, matRingScanWall)
+                            setNodeMaterial(liveRingWireNode, matRingScanWire)
+                            liveRingIsClingColor = false
+                        }
+                    } else {
+                        ring.isVisible = false
+                    }
+                }
+            }
+
+            if (shouldUpdateHud) {
+                lastHudUpdateMs = now
                 if (hasLiveCling) {
                     val wCm = (liveWidth * 100).roundToInt()
                     val dCm = (liveDepth * 100).roundToInt()
@@ -1530,16 +2347,14 @@ class MainActivity : AppCompatActivity() {
                     distIndicator.setTextColor(Color.parseColor("#E3B341"))
                 }
             }
-            overlayView.postInvalidate()
             return
         }
 
-        if (currentStepIdx >= sequence.size) {
-            overlayView.postInvalidate()
-            return
-        }
+        if (currentStepIdx >= sequence.size) return
 
         val anchor = prismAnchor ?: return
+        if (anchor.trackingState != TrackingState.TRACKING) return
+
         val anchorPose = anchor.pose
         val camPose = camera.pose
         val step = sequence[currentStepIdx]
@@ -1578,7 +2393,12 @@ class MainActivity : AppCompatActivity() {
 
         val isReadyToCapture = isNormalAligned && isCentered && isDistanceOptimal
 
-        runOnUiThread {
+        // Hide reticle when looking from behind the active facet
+        activeReticleNode?.isVisible = isFacingCamera && !isTakingCleanSnapshot
+
+        // Throttled 10 Hz HUD updates (eliminates Android UI layout thrashing!)
+        if (shouldUpdateHud) {
+            lastHudUpdateMs = now
             valDist.text = "DIST: ${distCm.roundToInt()}cm"
             valAlign.text = "TILT: ${actualTiltDeg}° [${step.targetTilt}°]"
 
@@ -1617,9 +2437,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val now = System.currentTimeMillis()
         if (isReadyToCapture && !isCapturing && now >= cooldownUntil) {
-            overlayView.isAligned = true
+            updateGpuFacetMaterialsAndReticle(isAlignedNow = true)
             if (alignStartTime == null) {
                 alignStartTime = now
             } else if (now - alignStartTime!! >= 450) {
@@ -1628,75 +2447,94 @@ class MainActivity : AppCompatActivity() {
             }
         } else {
             if (!isCapturing) {
-                overlayView.isAligned = false
+                updateGpuFacetMaterialsAndReticle(isAlignedNow = false)
                 alignStartTime = null
             }
         }
-
-        overlayView.postInvalidate()
     }
 
+    /**
+     * Hides the GPU 3D cage for 45ms under cover of the shutter flash so every captured
+     * JPEG plate saved for Modal 3D reconstruction is 100% clean and unobstructed.
+     */
     private fun triggerLocalCapture() {
         if (isCapturing || currentStepIdx >= sequence.size) return
         isCapturing = true
+        isTakingCleanSnapshot = true
 
         val snappedStepIdx = currentStepIdx
         val step = sequence[snappedStepIdx]
 
         playSnapFeedback()
+        prismAnchorNode?.isVisible = false
 
-        val bitmap = Bitmap.createBitmap(sceneView.width, sceneView.height, Bitmap.Config.ARGB_8888)
-        PixelCopy.request(
-            sceneView as SurfaceView,
-            bitmap,
-            PixelCopy.OnPixelCopyFinishedListener { copyResult ->
-                if (copyResult == PixelCopy.SUCCESS) {
-                    Thread {
-                        try {
-                            val file = File(cacheDir, "plate_${step.id}.jpg")
-                            val fos = FileOutputStream(file)
-                            bitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos)
-                            fos.flush()
-                            fos.close()
+        mainHandler.postDelayed({
+            val sW = sceneView.width
+            val sH = sceneView.height
+            if (sW <= 0 || sH <= 0) {
+                prismAnchorNode?.isVisible = true
+                isTakingCleanSnapshot = false
+                isCapturing = false
+                return@postDelayed
+            }
 
-                            val thumb = Bitmap.createScaledBitmap(bitmap, 128, 128, false)
-                            capturedThumbnails[snappedStepIdx] = thumb
+            val bitmap = Bitmap.createBitmap(sW, sH, Bitmap.Config.ARGB_8888)
+            PixelCopy.request(
+                sceneView as SurfaceView,
+                bitmap,
+                PixelCopy.OnPixelCopyFinishedListener { copyResult ->
+                    // Immediately restore GPU prism visibility once PixelCopy completes
+                    prismAnchorNode?.isVisible = true
+                    isTakingCleanSnapshot = false
 
-                            runOnUiThread {
-                                previewCardViews[snappedStepIdx].setImageBitmap(thumb)
+                    if (copyResult == PixelCopy.SUCCESS) {
+                        Thread {
+                            try {
+                                val file = File(cacheDir, "plate_${step.id}.jpg")
+                                val fos = FileOutputStream(file)
+                                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos)
+                                fos.flush()
+                                fos.close()
 
-                                currentStepIdx++
-                                isCapturing = false
-                                cooldownUntil = System.currentTimeMillis() + 800L
-                                alignStartTime = null
-                                updateChecklistUI()
+                                val thumb = Bitmap.createScaledBitmap(bitmap, 128, 128, false)
+                                capturedThumbnails[snappedStepIdx] = thumb
 
-                                if (currentStepIdx >= sequence.size) {
-                                    targetBadge.text = "✓ ALL 10 PLATES STORED LOCALLY"
-                                    targetBadge.setTextColor(Color.parseColor("#3FB950"))
-                                    distIndicator.text = "CAPTURE COMPLETE"
-                                    distIndicator.setTextColor(Color.parseColor("#3FB950"))
-                                    normalIndicator.text = "READY FOR MODAL BATCH UPLOAD"
-                                    centerIndicator.text = "TAP UPLOAD BELOW"
-                                    forceSnapBtn.visibility = View.GONE
-                                    scaleBar.visibility = View.GONE
-                                } else {
-                                    targetBadge.text = sequence[currentStepIdx].label
-                                    forceSnapBtn.text = "FORCE SNAP [${sequence[currentStepIdx].id.uppercase(Locale.US)}]"
+                                runOnUiThread {
+                                    previewCardViews[snappedStepIdx].setImageBitmap(thumb)
+
+                                    currentStepIdx++
+                                    isCapturing = false
+                                    cooldownUntil = System.currentTimeMillis() + 800L
+                                    alignStartTime = null
+                                    updateChecklistUI()
+                                    updateGpuFacetMaterialsAndReticle(isAlignedNow = false, forceUpdate = true)
+
+                                    if (currentStepIdx >= sequence.size) {
+                                        targetBadge.text = "✓ ALL 10 PLATES STORED LOCALLY"
+                                        targetBadge.setTextColor(Color.parseColor("#3FB950"))
+                                        distIndicator.text = "CAPTURE COMPLETE"
+                                        distIndicator.setTextColor(Color.parseColor("#3FB950"))
+                                        normalIndicator.text = "READY FOR MODAL BATCH UPLOAD"
+                                        centerIndicator.text = "TAP UPLOAD BELOW"
+                                        forceSnapBtn.visibility = View.GONE
+                                        scaleBar.visibility = View.GONE
+                                    } else {
+                                        targetBadge.text = sequence[currentStepIdx].label
+                                        forceSnapBtn.text = "FORCE SNAP [${sequence[currentStepIdx].id.uppercase(Locale.US)}]"
+                                    }
                                 }
-                                overlayView.postInvalidate()
+                            } catch (e: Exception) {
+                                Log.e("Capture", "Error saving plate locally", e)
+                                isCapturing = false
                             }
-                        } catch (e: Exception) {
-                            Log.e("Capture", "Error saving plate locally", e)
-                            isCapturing = false
-                        }
-                    }.start()
-                } else {
-                    isCapturing = false
-                }
-            },
-            Handler(Looper.getMainLooper())
-        )
+                        }.start()
+                    } else {
+                        isCapturing = false
+                    }
+                },
+                mainHandler
+            )
+        }, 45L)
     }
 
     private fun startBatchUpload() {
@@ -1757,7 +2595,7 @@ class MainActivity : AppCompatActivity() {
             toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
         } catch (e: Exception) {}
 
-        snapFlash.alpha = 0.5f
+        snapFlash.alpha = 0.65f
         snapFlash.visibility = View.VISIBLE
         snapFlash.animate()
             .alpha(0f)
@@ -1806,37 +2644,16 @@ class MainActivity : AppCompatActivity() {
         return anchorPose.transformPoint(rotated)
     }
 
-    private fun liveLocalToWorld(lx: Float, ly: Float, lz: Float): FloatArray {
-        val rotated = rotateByAzimuth(lx, ly, lz, liveAzimuth)
-        return floatArrayOf(liveWorldX + rotated[0], liveWorldY + rotated[1], liveWorldZ + rotated[2])
-    }
-
     private fun normalToWorld(nx: Float, ny: Float, nz: Float, anchorPose: Pose): FloatArray {
         val rotated = rotateByAzimuth(nx, ny, nz, initialAzimuth)
         return anchorPose.rotateVector(rotated)
     }
 
-    inner class PrismOverlayView(context: Context) : View(context) {
-
-        var isAligned = false
-
-        private val wirePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 2.5f
-        }
-
-        private val perforatedMeshPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-        }
-
-        private val reticlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 5f
-        }
-
-        private val fillReticlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-        }
+    /**
+     * Ultra-lightweight static 2D screen crosshair (no per-frame 3D projection or lag).
+     */
+    inner class CrosshairOverlayView(context: Context) : View(context) {
+        var showCrosshair = false
 
         private val centerGuidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(120, 255, 255, 255)
@@ -1844,467 +2661,16 @@ class MainActivity : AppCompatActivity() {
             strokeWidth = 3f
         }
 
-        private val webXrDiskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(40, 88, 166, 255)
-            style = Paint.Style.FILL
-        }
-
-        private val webXrWallBandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(42, 63, 185, 80)
-            style = Paint.Style.FILL
-        }
-
-        private val webXrRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.parseColor("#3FB950")
-            style = Paint.Style.STROKE
-            strokeWidth = 5.0f
-        }
-
-        private val webXrTopRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(230, 88, 235, 110)
-            style = Paint.Style.STROKE
-            strokeWidth = 3.8f
-        }
-
-        private val webXrInnerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(180, 255, 255, 255)
-            style = Paint.Style.STROKE
-            strokeWidth = 2.2f
-        }
-
-        private val webXrRibPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(150, 63, 185, 80)
-            style = Paint.Style.STROKE
-            strokeWidth = 2.4f
-        }
-
-        private val viewMatrix = FloatArray(16)
-        private val projMatrix = FloatArray(16)
-        private val vpMatrix = FloatArray(16)
-
-        private val redMeshShader = createPerforatedShader(Color.parseColor("#F85149"))
-        private val greenMeshShader = createPerforatedShader(Color.parseColor("#3FB950"))
-        private val greyMeshShader = createPerforatedShader(Color.parseColor("#8B949E"))
-
-        private fun createPerforatedShader(baseColor: Int): BitmapShader {
-            val tileSize = 24
-            val bmp = Bitmap.createBitmap(tileSize, tileSize, Bitmap.Config.ARGB_8888)
-            val cv = Canvas(bmp)
-
-            val bodyPaint = Paint().apply {
-                color = Color.argb(175, Color.red(baseColor), Color.green(baseColor), Color.blue(baseColor))
-                style = Paint.Style.FILL
-            }
-            cv.drawRect(0f, 0f, tileSize.toFloat(), tileSize.toFloat(), bodyPaint)
-
-            val clearHolePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
-            }
-            val holeR = 5.2f
-            cv.drawCircle(tileSize / 2f, tileSize / 2f, holeR, clearHolePaint)
-            cv.drawCircle(0f, 0f, holeR, clearHolePaint)
-            cv.drawCircle(tileSize.toFloat(), 0f, holeR, clearHolePaint)
-            cv.drawCircle(0f, tileSize.toFloat(), holeR, clearHolePaint)
-            cv.drawCircle(tileSize.toFloat(), tileSize.toFloat(), holeR, clearHolePaint)
-
-            val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(90, 255, 255, 255)
-                style = Paint.Style.STROKE
-                strokeWidth = 1.0f
-            }
-            cv.drawCircle(tileSize / 2f, tileSize / 2f, holeR, rimPaint)
-            cv.drawCircle(0f, 0f, holeR, rimPaint)
-            cv.drawCircle(tileSize.toFloat(), 0f, holeR, rimPaint)
-            cv.drawCircle(0f, tileSize.toFloat(), holeR, rimPaint)
-            cv.drawCircle(tileSize.toFloat(), tileSize.toFloat(), holeR, rimPaint)
-
-            return BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
-        }
-
-        private fun getMeshShaderForColor(color: Int): BitmapShader {
-            return when (color) {
-                Color.parseColor("#3FB950") -> greenMeshShader
-                Color.parseColor("#8B949E") -> greyMeshShader
-                else -> redMeshShader
-            }
-        }
-
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val frame = lastFrame ?: return
-            val camera = frame.camera
-            if (camera.trackingState != TrackingState.TRACKING) return
-
-            camera.getViewMatrix(viewMatrix, 0)
-            camera.getProjectionMatrix(projMatrix, 0, 0.05f, 50.0f)
-            Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
-
-            val screenW = width.toFloat()
-            val screenH = height.toFloat()
-
-            // =========================================================================
-            // PRE-LOCK PHASE: 3D VOLUMETRIC ENCAPSULATING RING AROUND THE ENTIRE ASSET
-            // =========================================================================
-            if (!isBoxPlaced) {
-                if (hasLiveCling) {
-                    val rx = (liveWidth * 0.68f).coerceIn(0.032f, 0.26f)
-                    val rz = (liveDepth * 0.68f).coerceIn(0.032f, 0.26f)
-                    val ringH = liveHeight.coerceIn(0.032f, 0.22f)
-
-                    val basePts = mutableListOf<PointF?>()
-                    val midPts = mutableListOf<PointF?>()
-                    val topPts = mutableListOf<PointF?>()
-                    val innerBasePts = mutableListOf<PointF?>()
-                    val steps = 36
-
-                    for (i in 0 until steps) {
-                        val ang = (2.0 * Math.PI * i / steps)
-                        val c = cos(ang)
-                        val s = sin(ang)
-                        val lx = (rx * c.sign * abs(c).pow(0.82)).toFloat()
-                        val lz = (rz * s.sign * abs(s).pow(0.82)).toFloat()
-
-                        basePts.add(projectPoint(liveLocalToWorld(lx, 0f, lz), screenW, screenH))
-                        midPts.add(projectPoint(liveLocalToWorld(lx, ringH * 0.5f, lz), screenW, screenH))
-                        topPts.add(projectPoint(liveLocalToWorld(lx, ringH, lz), screenW, screenH))
-                        innerBasePts.add(projectPoint(liveLocalToWorld(lx * 0.86f, 0f, lz * 0.86f), screenW, screenH))
-                    }
-
-                    if (basePts.all { it != null } && topPts.all { it != null } && midPts.all { it != null }) {
-                        for (i in 0 until steps) {
-                            val next = (i + 1) % steps
-                            val quadPath = Path().apply {
-                                moveTo(basePts[i]!!.x, basePts[i]!!.y)
-                                lineTo(basePts[next]!!.x, basePts[next]!!.y)
-                                lineTo(topPts[next]!!.x, topPts[next]!!.y)
-                                lineTo(topPts[i]!!.x, topPts[i]!!.y)
-                                close()
-                            }
-                            canvas.drawPath(quadPath, webXrWallBandPaint)
-                        }
-
-                        for (i in 0 until steps step 2) {
-                            canvas.drawLine(
-                                basePts[i]!!.x, basePts[i]!!.y,
-                                topPts[i]!!.x, topPts[i]!!.y,
-                                if (i % 9 == 0) webXrRingPaint else webXrRibPaint
-                            )
-                        }
-
-                        for (i in 0 until steps step 2) {
-                            val next = (i + 1) % steps
-                            canvas.drawLine(midPts[i]!!.x, midPts[i]!!.y, midPts[next]!!.x, midPts[next]!!.y, webXrInnerRingPaint)
-                        }
-
-                        webXrRingPaint.color = Color.parseColor("#3FB950")
-                        for (i in 0 until steps) {
-                            val next = (i + 1) % steps
-                            canvas.drawLine(basePts[i]!!.x, basePts[i]!!.y, basePts[next]!!.x, basePts[next]!!.y, webXrRingPaint)
-                            if (innerBasePts[i] != null && innerBasePts[next] != null && i % 2 == 0) {
-                                canvas.drawLine(innerBasePts[i]!!.x, innerBasePts[i]!!.y, innerBasePts[next]!!.x, innerBasePts[next]!!.y, webXrInnerRingPaint)
-                            }
-                        }
-
-                        for (i in 0 until steps) {
-                            val next = (i + 1) % steps
-                            canvas.drawLine(topPts[i]!!.x, topPts[i]!!.y, topPts[next]!!.x, topPts[next]!!.y, webXrTopRingPaint)
-                        }
-                    }
-                    return
-                }
-
-                val hitResults = frame.hitTest(screenW / 2f, screenH / 2f)
-                val hit = hitResults.firstOrNull()
-                if (hit != null) {
-                    val hp = hit.hitPose
-                    val diskRadius = 0.075f
-                    val ringH = 0.035f
-                    val bPts = mutableListOf<PointF?>()
-                    val tPts = mutableListOf<PointF?>()
-
-                    webXrDiskPaint.color = Color.argb(35, 88, 166, 255)
-                    webXrRingPaint.color = Color.parseColor("#58A6FF")
-
-                    for (i in 0 until 32) {
-                        val ang = (2.0 * Math.PI * i / 32).toFloat()
-                        val wx = hp.tx() + diskRadius * cos(ang)
-                        val wz = hp.tz() + diskRadius * sin(ang)
-                        bPts.add(projectPoint(wx, hp.ty(), wz, screenW, screenH))
-                        tPts.add(projectPoint(wx, hp.ty() + ringH, wz, screenW, screenH))
-                    }
-
-                    if (bPts.all { it != null } && tPts.all { it != null }) {
-                        for (i in bPts.indices) {
-                            val next = (i + 1) % bPts.size
-                            canvas.drawLine(bPts[i]!!.x, bPts[i]!!.y, bPts[next]!!.x, bPts[next]!!.y, webXrRingPaint)
-                            canvas.drawLine(tPts[i]!!.x, tPts[i]!!.y, tPts[next]!!.x, tPts[next]!!.y, webXrInnerRingPaint)
-                            if (i % 4 == 0) {
-                                canvas.drawLine(bPts[i]!!.x, bPts[i]!!.y, tPts[i]!!.x, tPts[i]!!.y, webXrInnerRingPaint)
-                            }
-                        }
-                    }
-                }
-                return
-            }
-
-            val anchor = prismAnchor ?: return
-            val anchorPose = anchor.pose
-
-            canvas.drawCircle(screenW / 2f, screenH / 2f, 75f, centerGuidePaint)
-            canvas.drawCircle(screenW / 2f, screenH / 2f, 8f, centerGuidePaint)
-
-            val hW = prismWidth / 2f
-            val hD = prismDepth / 2f
-            val r = min(hW, hD) * 0.36f
-            val hMid = prismHeight * 0.50f
-            val tan30 = tan(Math.toRadians(30.0)).toFloat()
-            val dChamfer = min((prismHeight - hMid) * tan30, r * 0.82f)
-            val rTop = max(r - dChamfer * 0.45f, 0.02f)
-
-            val baseLoop = generateFilletedSquircleLoop(hW, hD, r)
-            val midLoop = generateFilletedSquircleLoop(hW, hD, r)
-            val topLoop = generateFilletedSquircleLoop(hW - dChamfer, hD - dChamfer, rTop)
-
-            val greyColor = Color.parseColor("#8B949E")
-            val activeRed = Color.parseColor("#F85149")
-            val capturedGreen = Color.parseColor("#3FB950")
-
-            for (sector in 0 until 4) {
-                val facetIdx = sector * 2
-                val isCaptured = capturedThumbnails.containsKey(facetIdx)
-                val isActiveStep = currentStepIdx == facetIdx
-                val wallColor = when {
-                    isCaptured -> capturedGreen
-                    isActiveStep && isAligned -> capturedGreen
-                    else -> activeRed
-                }
-                drawFilletedWallSector(canvas, sector, baseLoop, midLoop, 0f, hMid, anchorPose, screenW, screenH, wallColor, true)
-                drawFilletedCornerSector(canvas, sector, baseLoop, midLoop, 0f, hMid, anchorPose, screenW, screenH, greyColor, false)
-            }
-
-            for (sector in 0 until 4) {
-                drawFilletedWallSector(canvas, sector, midLoop, topLoop, hMid, prismHeight, anchorPose, screenW, screenH, greyColor, false)
-
-                val facetIdx = sector * 2 + 1
-                val isCaptured = capturedThumbnails.containsKey(facetIdx)
-                val isActiveStep = currentStepIdx == facetIdx
-                val chamferColor = when {
-                    isCaptured -> capturedGreen
-                    isActiveStep && isAligned -> capturedGreen
-                    else -> activeRed
-                }
-                drawFilletedCornerSector(canvas, sector, midLoop, topLoop, hMid, prismHeight, anchorPose, screenW, screenH, chamferColor, true)
-            }
-
-            val isTopCaptured = capturedThumbnails.containsKey(8)
-            val isTopActiveStep = currentStepIdx == 8
-            val topColor = when {
-                isTopCaptured -> capturedGreen
-                isTopActiveStep && isAligned -> capturedGreen
-                else -> activeRed
-            }
-            drawTopCap(canvas, topLoop, prismHeight, anchorPose, screenW, screenH, topColor, true)
-
-            if (currentStepIdx < sequence.size) {
-                val desc = getFacetDescriptor(currentStepIdx)
-                val faceCenterWorld = localToWorld(desc.centerX, desc.centerY, desc.centerZ, anchorPose)
-                val faceNormalWorld = normalToWorld(desc.normX, desc.normY, desc.normZ, anchorPose)
-
-                val camPose = camera.pose
-                val camToFaceX = camPose.tx() - faceCenterWorld[0]
-                val camToFaceY = camPose.ty() - faceCenterWorld[1]
-                val camToFaceZ = camPose.tz() - faceCenterWorld[2]
-                val facingDot = camToFaceX * faceNormalWorld[0] + camToFaceY * faceNormalWorld[1] + camToFaceZ * faceNormalWorld[2]
-
-                if (facingDot > 0.001f) {
-                    drawPlanar3DReticle(canvas, desc, anchorPose, screenW, screenH)
-                }
-            }
-        }
-
-        private fun generateFilletedSquircleLoop(hW: Float, hD: Float, r: Float): List<FloatArray> {
-            val loop = mutableListOf<FloatArray>()
-            val xS = hW - r
-            val zS = hD - r
-
-            for (quad in 0 until 4) {
-                when (quad) {
-                    0 -> { loop.add(floatArrayOf(-xS, 0f, hD)); loop.add(floatArrayOf(xS, 0f, hD)) }
-                    1 -> { loop.add(floatArrayOf(hW, 0f, zS)); loop.add(floatArrayOf(hW, 0f, -zS)) }
-                    2 -> { loop.add(floatArrayOf(xS, 0f, -hD)); loop.add(floatArrayOf(-xS, 0f, -hD)) }
-                    3 -> { loop.add(floatArrayOf(-hW, 0f, -zS)); loop.add(floatArrayOf(-hW, 0f, zS)) }
-                }
-
-                val cX = if (quad == 0 || quad == 1) xS else -xS
-                val cZ = if (quad == 0 || quad == 3) zS else -zS
-                val startAngle = Math.toRadians((90.0 - quad * 90.0))
-
-                for (step in 1..4) {
-                    val angle = startAngle - (Math.PI / 2.0) * (step / 5.0)
-                    val px = cX + r * cos(angle).toFloat()
-                    val pz = cZ + r * sin(angle).toFloat()
-                    loop.add(floatArrayOf(px, 0f, pz))
-                }
-            }
-            return loop
-        }
-
-        private fun drawFilletedWallSector(
-            canvas: Canvas, sector: Int,
-            base: List<FloatArray>, top: List<FloatArray>,
-            y0: Float, y1: Float,
-            anchorPose: Pose,
-            w: Float, h: Float, color: Int, isActive: Boolean
-        ) {
-            val i0 = sector * 6
-            val i1 = (i0 + 1) % base.size
-
-            val p0 = projectPoint(localToWorld(base[i0][0], y0, base[i0][2], anchorPose), w, h)
-            val p1 = projectPoint(localToWorld(base[i1][0], y0, base[i1][2], anchorPose), w, h)
-            val p2 = projectPoint(localToWorld(top[i1][0], y1, top[i1][2], anchorPose), w, h)
-            val p3 = projectPoint(localToWorld(top[i0][0], y1, top[i0][2], anchorPose), w, h)
-
-            if (p0 != null && p1 != null && p2 != null && p3 != null) {
-                perforatedMeshPaint.shader = getMeshShaderForColor(color)
-                val path = Path().apply {
-                    moveTo(p0.x, p0.y); lineTo(p1.x, p1.y); lineTo(p2.x, p2.y); lineTo(p3.x, p3.y); close()
-                }
-                canvas.drawPath(path, perforatedMeshPaint)
-
-                wirePaint.color = color
-                wirePaint.strokeWidth = if (isActive) 3.5f else 2.2f
-                canvas.drawLine(p0.x, p0.y, p1.x, p1.y, wirePaint)
-                canvas.drawLine(p1.x, p1.y, p2.x, p2.y, wirePaint)
-                canvas.drawLine(p2.x, p2.y, p3.x, p3.y, wirePaint)
-                canvas.drawLine(p3.x, p3.y, p0.x, p0.y, wirePaint)
-            }
-        }
-
-        private fun drawFilletedCornerSector(
-            canvas: Canvas, corner: Int,
-            base: List<FloatArray>, top: List<FloatArray>,
-            y0: Float, y1: Float,
-            anchorPose: Pose,
-            w: Float, h: Float, color: Int, isActive: Boolean
-        ) {
-            val startIdx = corner * 6 + 1
-            perforatedMeshPaint.shader = getMeshShaderForColor(color)
-
-            wirePaint.color = color
-            wirePaint.strokeWidth = if (isActive) 3.0f else 2.0f
-
-            for (step in 0 until 5) {
-                val iA = (startIdx + step) % base.size
-                val iB = (startIdx + step + 1) % base.size
-
-                val p0 = projectPoint(localToWorld(base[iA][0], y0, base[iA][2], anchorPose), w, h)
-                val p1 = projectPoint(localToWorld(base[iB][0], y0, base[iB][2], anchorPose), w, h)
-                val p2 = projectPoint(localToWorld(top[iB][0], y1, top[iB][2], anchorPose), w, h)
-                val p3 = projectPoint(localToWorld(top[iA][0], y1, top[iA][2], anchorPose), w, h)
-
-                if (p0 != null && p1 != null && p2 != null && p3 != null) {
-                    val path = Path().apply {
-                        moveTo(p0.x, p0.y); lineTo(p1.x, p1.y); lineTo(p2.x, p2.y); lineTo(p3.x, p3.y); close()
-                    }
-                    canvas.drawPath(path, perforatedMeshPaint)
-
-                    canvas.drawLine(p0.x, p0.y, p1.x, p1.y, wirePaint)
-                    canvas.drawLine(p2.x, p2.y, p3.x, p3.y, wirePaint)
-                    if (step == 0) canvas.drawLine(p0.x, p0.y, p3.x, p3.y, wirePaint)
-                    if (step == 4) canvas.drawLine(p1.x, p1.y, p2.x, p2.y, wirePaint)
-                }
-            }
-        }
-
-        private fun drawTopCap(
-            canvas: Canvas, top: List<FloatArray>, y: Float,
-            anchorPose: Pose,
-            w: Float, h: Float, color: Int, fill: Boolean
-        ) {
-            val pts = top.map { projectPoint(localToWorld(it[0], y, it[2], anchorPose), w, h) }
-            if (pts.all { it != null }) {
-                val isTopCaptured = capturedThumbnails.containsKey(8)
-                val isTopActiveStep = currentStepIdx == 8
-                val isActive = isTopCaptured || isTopActiveStep
-
-                if (fill) {
-                    perforatedMeshPaint.shader = getMeshShaderForColor(color)
-                    val path = Path().apply {
-                        moveTo(pts[0]!!.x, pts[0]!!.y)
-                        for (i in 1 until pts.size) lineTo(pts[i]!!.x, pts[i]!!.y)
-                        close()
-                    }
-                    canvas.drawPath(path, perforatedMeshPaint)
-                }
-
-                wirePaint.color = color
-                wirePaint.strokeWidth = if (isActive) 3.5f else 2.5f
-                for (i in pts.indices) {
-                    val next = (i + 1) % pts.size
-                    canvas.drawLine(pts[i]!!.x, pts[i]!!.y, pts[next]!!.x, pts[next]!!.y, wirePaint)
-                }
-            }
-        }
-
-        private fun drawPlanar3DReticle(canvas: Canvas, desc: FacetDesc, anchorPose: Pose, w: Float, h: Float) {
-            val rColor = if (isAligned) Color.parseColor("#3FB950") else Color.parseColor("#F85149")
-            reticlePaint.color = rColor
-            fillReticlePaint.color = rColor
-
-            val nx = desc.normX; val ny = desc.normY; val nz = desc.normZ
-            val ux: Float; val uy: Float; val uz: Float
-
-            if (abs(ny) > 0.95f) {
-                ux = 1f; uy = 0f; uz = 0f
+            val cx = width / 2f
+            val cy = height / 2f
+            if (showCrosshair) {
+                canvas.drawCircle(cx, cy, 75f, centerGuidePaint)
+                canvas.drawCircle(cx, cy, 8f, centerGuidePaint)
             } else {
-                val len = sqrt(nz * nz + nx * nx)
-                ux = nz / len; uy = 0f; uz = -nx / len
+                canvas.drawCircle(cx, cy, 6f, centerGuidePaint)
             }
-            val vx = ny * uz - nz * uy
-            val vy = nz * ux - nx * uz
-            val vz = nx * uy - ny * ux
-
-            val radius = min(prismWidth, prismDepth) * 0.20f
-
-            val ringPts = mutableListOf<PointF?>()
-            for (i in 0 until 16) {
-                val angle = (2.0 * Math.PI * i / 16).toFloat()
-                val px = desc.centerX + radius * (cos(angle) * ux + sin(angle) * vx) + nx * 0.003f
-                val py = desc.centerY + radius * (cos(angle) * uy + sin(angle) * vy) + ny * 0.003f
-                val pz = desc.centerZ + radius * (cos(angle) * uz + sin(angle) * vz) + nz * 0.003f
-                ringPts.add(projectPoint(localToWorld(px, py, pz, anchorPose), w, h))
-            }
-
-            for (i in 0 until 16) {
-                val next = (i + 1) % 16
-                if (ringPts[i] != null && ringPts[next] != null) {
-                    canvas.drawLine(ringPts[i]!!.x, ringPts[i]!!.y, ringPts[next]!!.x, ringPts[next]!!.y, reticlePaint)
-                }
-            }
-
-            val ch = radius * 1.4f
-            val h1 = projectPoint(localToWorld(desc.centerX - ux * ch + nx * 0.003f, desc.centerY - uy * ch + ny * 0.003f, desc.centerZ - uz * ch + nz * 0.003f, anchorPose), w, h)
-            val h2 = projectPoint(localToWorld(desc.centerX + ux * ch + nx * 0.003f, desc.centerY + uy * ch + ny * 0.003f, desc.centerZ + uz * ch + nz * 0.003f, anchorPose), w, h)
-            if (h1 != null && h2 != null) canvas.drawLine(h1.x, h1.y, h2.x, h2.y, reticlePaint)
-
-            val centerPt = projectPoint(localToWorld(desc.centerX + nx * 0.003f, desc.centerY + ny * 0.003f, desc.centerZ + nz * 0.003f, anchorPose), w, h)
-            if (centerPt != null) canvas.drawCircle(centerPt.x, centerPt.y, 14f, fillReticlePaint)
-        }
-
-        private fun projectPoint(x: Float, y: Float, z: Float, screenW: Float, screenH: Float): PointF? {
-            return projectPoint(floatArrayOf(x, y, z), screenW, screenH)
-        }
-
-        private fun projectPoint(worldCoords: FloatArray, screenW: Float, screenH: Float): PointF? {
-            val clipVec = FloatArray(4)
-            Matrix.multiplyMV(clipVec, 0, vpMatrix, 0, floatArrayOf(worldCoords[0], worldCoords[1], worldCoords[2], 1.0f), 0)
-            val w = clipVec[3]
-            if (w <= 0.01f) return null
-            val ndcX = clipVec[0] / w
-            val ndcY = clipVec[1] / w
-            val sx = (ndcX * 0.5f + 0.5f) * screenW
-            val sy = (-ndcY * 0.5f + 0.5f) * screenH
-            return PointF(sx, sy)
         }
     }
 }
