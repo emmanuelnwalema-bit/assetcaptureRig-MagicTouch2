@@ -32,6 +32,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -40,6 +42,8 @@ import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.*
 
@@ -84,21 +88,40 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (U2Net-P + MagicTouch Cascade)\n")
+    private val debugLog = StringBuilder("App Initialized (GPU U2Net-P + MagicTouch Cascade)\n")
     private var toneGen: ToneGenerator? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // =========================================================
-    // TWO-MODEL ON-DEVICE CASCADE (U2Net-P -> MagicTouch)
+    // TWO-MODEL ON-DEVICE CASCADE (GPU U2Net-P -> MagicTouch)
     // =========================================================
+    // Dedicated single-thread executor preserves Android EGL/OpenCL context affinity for GpuDelegate
+    private val u2netExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var u2netGpuDelegate: GpuDelegate? = null
     @Volatile private var u2netInterpreter: Interpreter? = null
+    @Volatile private var u2netUsingGpu = false
+    @Volatile private var lastPreLockLatencyMs = 0L
+
     @Volatile private var magicTouchInterpreter: Interpreter? = null
     private val u2netAssetName = "u2netp.tflite"
     private val magicTouchAssetName = "magic_touch.tflite"
 
+    // Pre-allocated U2Net-P inference buffers (reused on u2netExecutor to avoid GC pauses)
+    private var u2netInputBuf: ByteBuffer? = null
+    private var u2netOutputBuf: ByteBuffer? = null
+    private var u2netPixelBuf: IntArray? = null
+
     @Volatile private var isPreLockMlRunning = false
     private var lastPreLockMlTriggerMs = 0L
     private var preLockCopyBmp: Bitmap? = null
+
+    // Live camera pose snapshot for mid-pan stale-frame rejection
+    @Volatile private var liveCamX = 0f
+    @Volatile private var liveCamY = 0f
+    @Volatile private var liveCamZ = 0f
+    @Volatile private var liveCamFwdX = 0f
+    @Volatile private var liveCamFwdY = 0f
+    @Volatile private var liveCamFwdZ = -1f
 
     private var currentStepIdx = 0
     private var isBoxPlaced = false
@@ -128,7 +151,7 @@ class MainActivity : AppCompatActivity() {
     private var prismHeight = 0.05f
 
     // =========================================================
-    // 3D ENCAPSULATING RING LIVE CLING STATE (DRIVEN BY U2NET-P)
+    // 3D ENCAPSULATING RING LIVE CLING STATE (DRIVEN BY GPU U2NET-P)
     // =========================================================
     @Volatile private var hasLiveCling = false
     @Volatile private var liveWorldX = 0f
@@ -290,8 +313,14 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         try {
             prismAnchor?.detach()
-            u2netInterpreter?.close()
             magicTouchInterpreter?.close()
+            u2netExecutor.execute {
+                try { u2netInterpreter?.close() } catch (_: Exception) {}
+                try { u2netGpuDelegate?.close() } catch (_: Exception) {}
+                u2netInterpreter = null
+                u2netGpuDelegate = null
+            }
+            u2netExecutor.shutdown()
         } catch (e: Exception) {}
     }
 
@@ -329,7 +358,7 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("U2Net-P + MagicTouch Diagnostics")
+                .setTitle("GPU U2Net-P + MagicTouch Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
@@ -337,37 +366,82 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun loadTfliteFromAssets(assetName: String, threads: Int): Interpreter {
+    private fun mapAssetBuffer(assetName: String): ByteBuffer {
         val fd: AssetFileDescriptor = assets.openFd(assetName)
         val inputStream = FileInputStream(fd.fileDescriptor)
         val fileChannel = inputStream.channel
-        val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-        val options = Interpreter.Options().apply { setNumThreads(threads) }
-        return Interpreter(modelBuffer, options)
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
     }
 
     private fun initCascadeModels() {
-        Thread {
-            // Model 1: U2Net-P (Pre-Lock Salient Object Magnetic Cling)
+        // Model 1: U2Net-P initialized strictly on u2netExecutor for GPU Delegate thread affinity
+        u2netExecutor.execute {
             try {
                 logDebug("Loading Model 1: $u2netAssetName...")
-                val interp = loadTfliteFromAssets(u2netAssetName, 4)
+                val modelBuffer = mapAssetBuffer(u2netAssetName)
+                var interp: Interpreter? = null
+                var gpuActive = false
+
+                val compatList = CompatibilityList()
+                try {
+                    if (compatList.isDelegateSupportedOnThisDevice) {
+                        try {
+                            val gpuOpts = compatList.bestOptionsForThisDevice
+                            val delegate = GpuDelegate(gpuOpts)
+                            val opts = Interpreter.Options().apply {
+                                addDelegate(delegate)
+                            }
+                            interp = Interpreter(modelBuffer, opts)
+                            u2netGpuDelegate = delegate
+                            gpuActive = true
+                        } catch (gpuErr: Throwable) {
+                            logDebug("⚠️ U2Net-P GPU Delegate declined (${gpuErr.javaClass.simpleName}): falling back to CPU XNNPACK")
+                            try { u2netGpuDelegate?.close() } catch (_: Exception) {}
+                            u2netGpuDelegate = null
+                        }
+                    }
+                } finally {
+                    compatList.close()
+                }
+
+                if (interp == null) {
+                    val cpuOpts = Interpreter.Options().apply {
+                        setNumThreads(4)
+                        setUseXNNPACK(true)
+                    }
+                    interp = Interpreter(modelBuffer, cpuOpts)
+                }
+
                 u2netInterpreter = interp
-                val inS = interp.getInputTensor(0).shape()
-                val outS = interp.getOutputTensor(0).shape()
-                logDebug("✓ U2Net-P Ready! In:${inS.contentToString()} Out:${outS.contentToString()}")
+                u2netUsingGpu = gpuActive
+
+                // Pre-allocate reusable input/output buffers on u2netExecutor
+                val inTensor = interp.getInputTensor(0)
+                val outTensor = interp.getOutputTensor(0)
+                u2netInputBuf = ByteBuffer.allocateDirect(inTensor.numBytes()).order(ByteOrder.nativeOrder())
+                u2netOutputBuf = ByteBuffer.allocateDirect(outTensor.numBytes()).order(ByteOrder.nativeOrder())
+
+                val backend = if (gpuActive) "GPU" else "CPU-XNNPACK"
+                logDebug("✓ U2Net-P Ready [$backend]! In:${inTensor.shape().contentToString()} Out:${outTensor.shape().contentToString()}")
             } catch (e: Exception) {
                 logDebug("⚠️ $u2netAssetName not found — pre-lock will use live MagicTouch fallback")
             }
+        }
 
-            // Model 2: MagicTouch (Post-Lock Prompted Refinement)
+        // Model 2: MagicTouch (one-shot high-precision refinement on Lock via 4-thread CPU XNNPACK)
+        Thread {
             try {
                 logDebug("Loading Model 2: $magicTouchAssetName...")
-                val interp = loadTfliteFromAssets(magicTouchAssetName, 4)
+                val modelBuffer = mapAssetBuffer(magicTouchAssetName)
+                val options = Interpreter.Options().apply {
+                    setNumThreads(4)
+                    setUseXNNPACK(true)
+                }
+                val interp = Interpreter(modelBuffer, options)
                 magicTouchInterpreter = interp
                 val inS = interp.getInputTensor(0).shape()
                 val outS = interp.getOutputTensor(0).shape()
-                logDebug("✓ MagicTouch Ready! In:${inS.contentToString()} Out:${outS.contentToString()}")
+                logDebug("✓ MagicTouch Ready [CPU-XNNPACK]! In:${inS.contentToString()} Out:${outS.contentToString()}")
             } catch (e: Exception) {
                 logDebug("❌ MagicTouch Load Failed: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -483,12 +557,6 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    /**
-     * Strictly resolves the physical horizontal TABLE plane elevation (never a floating
-     * feature Point or DepthPoint on top of the asset). If the center ray strikes the asset,
-     * casts an 8-point perimeter ring on the surrounding table and intersects the center ray
-     * mathematically with the winning HORIZONTAL_UPWARD_FACING Plane's Y elevation.
-     */
     private fun resolveStrictTableSurface(frame: Frame): Pair<Plane?, Pose?> {
         val sW = sceneView.width.toFloat()
         val sH = sceneView.height.toFloat()
@@ -515,7 +583,6 @@ class MainActivity : AppCompatActivity() {
             return Pair(rootPlane, pose)
         }
 
-        // Center ray hit the elevated object -> cast 8 perimeter rays on the table surrounding it
         val minDim = min(sW, sH)
         val ringR = minDim * 0.28f
         val planeVotes = mutableMapOf<Plane, Int>()
@@ -557,10 +624,6 @@ class MainActivity : AppCompatActivity() {
         return Pair(null, null)
     }
 
-    /**
-     * Measures real physical object height above tableSurfaceY synchronously from ARCore's
-     * 16-bit Depth map (if supported), falling back cleanly to ARCore PointCloud elevation.
-     */
     private fun measureObjectHeightSync(
         frame: Frame,
         tableSurfaceY: Float,
@@ -577,7 +640,6 @@ class MainActivity : AppCompatActivity() {
         val invVp = FloatArray(16)
         val hasInvVp = Matrix.invertM(invVp, 0, frameVpMatrix, 0)
 
-        // 1. Try ARCore 16-bit Depth Image (highest accuracy for smooth/glossy/matte assets)
         if (hasInvVp) {
             var depthImg: Image? = null
             try {
@@ -647,13 +709,11 @@ class MainActivity : AppCompatActivity() {
                     return (p85 * 1.12f).coerceIn(0.028f, 0.28f)
                 }
             } catch (_: Throwable) {
-                // Depth not yet available or unsupported on this device -> fall back to PointCloud
             } finally {
                 try { depthImg?.close() } catch (_: Exception) {}
             }
         }
 
-        // 2. Fallback: ARCore Feature PointCloud elevation above tableSurfaceY
         try {
             val pc = frame.acquirePointCloud()
             val pBuf = pc.points
@@ -734,7 +794,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // PHASE 1: LIVE ASYNC U2NET-P SALIENT OBJECT CLING (PRE-LOCK ~6 FPS)
+    // PHASE 1: REAL-TIME GPU U2NET-P SALIENT OBJECT CLING (PRE-LOCK)
     // =========================================================================
     private fun triggerPreLockNeuralCling(frame: Frame, tablePose: Pose) {
         val sW = sceneView.width
@@ -748,7 +808,6 @@ class MainActivity : AppCompatActivity() {
         isPreLockMlRunning = true
         lastPreLockMlTriggerMs = System.currentTimeMillis()
 
-        // Snapshot exact camera VP, table elevation, camera pose, and depth height synchronously
         val snapVp = frameVpMatrix.copyOf()
         val snapInvVp = FloatArray(16)
         if (!Matrix.invertM(snapInvVp, 0, snapVp, 0)) {
@@ -758,8 +817,12 @@ class MainActivity : AppCompatActivity() {
 
         val tableY = tablePose.ty()
         val camPose = frame.camera.pose
-        val camX = camPose.tx()
-        val camZ = camPose.tz()
+        val snapCamX = camPose.tx()
+        val snapCamY = camPose.ty()
+        val snapCamZ = camPose.tz()
+        val snapFwdX = -camPose.zAxis[0]
+        val snapFwdY = -camPose.zAxis[1]
+        val snapFwdZ = -camPose.zAxis[2]
 
         val probeScreenX = if (hasLiveCling) liveClingScreenX else sW * 0.5f
         val probeScreenY = if (hasLiveCling) liveClingScreenY else sH * 0.5f
@@ -769,7 +832,6 @@ class MainActivity : AppCompatActivity() {
             frame, tableY, probeScreenX, probeScreenY, probeWorldX, probeWorldZ, max(liveWidth, liveDepth) * 0.65f
         )
 
-        // Hardware-downscaled PixelCopy straight into a compact reusable Bitmap (zero overlay artifacts!)
         val targetW = 320
         val targetH = max(320, (320f * sH / sW).roundToInt())
         if (preLockCopyBmp == null || preLockCopyBmp!!.width != targetW || preLockCopyBmp!!.height != targetH) {
@@ -786,10 +848,11 @@ class MainActivity : AppCompatActivity() {
                     return@OnPixelCopyFinishedListener
                 }
 
-                // Clone pixel array into worker thread so PixelCopy buffer isn't overwritten
                 val bmpCopy = destBmp.copy(Bitmap.Config.ARGB_8888, false)
-                Thread {
+                // Always run U2Net-P on u2netExecutor to keep its GPU delegate context bound to one thread
+                u2netExecutor.execute {
                     try {
+                        val t0 = System.currentTimeMillis()
                         val minDimSmall = min(bmpCopy.width, bmpCopy.height)
                         val cropXSmall = (bmpCopy.width - minDimSmall) / 2
                         val cropYSmall = (bmpCopy.height - minDimSmall) / 2
@@ -800,12 +863,27 @@ class MainActivity : AppCompatActivity() {
                         val cropXFull = (sW - minDimFull) * 0.5f
                         val cropYFull = (sH - minDimFull) * 0.5f
 
-                        val maskPair = if (u2net != null) {
-                            runU2NetSaliencyMask(u2net, squareSmall)
+                        val activeU2 = u2netInterpreter
+                        val maskPair = if (activeU2 != null) {
+                            runU2NetSaliencyMask(activeU2, squareSmall)
+                        } else if (magicFallback != null) {
+                            runMagicTouchMaskOnly(magicFallback, squareSmall, 0.5f, 0.5f)
                         } else {
-                            runMagicTouchMaskOnly(magicFallback!!, squareSmall, 0.5f, 0.5f)
+                            null
                         }
                         squareSmall.recycle()
+                        lastPreLockLatencyMs = System.currentTimeMillis() - t0
+
+                        // Reject stale mid-pan inference if camera rotated > 12° or moved > 6cm while running
+                        val rotDot = snapFwdX * liveCamFwdX + snapFwdY * liveCamFwdY + snapFwdZ * liveCamFwdZ
+                        val camShift = sqrt(
+                            (liveCamX - snapCamX).pow(2) +
+                                (liveCamY - snapCamY).pow(2) +
+                                (liveCamZ - snapCamZ).pow(2)
+                        )
+                        if (rotDot < 0.978f || camShift > 0.06f) {
+                            return@execute
+                        }
 
                         if (maskPair != null && !isBoxPlaced) {
                             val (gridMask, gSize) = maskPair
@@ -813,7 +891,7 @@ class MainActivity : AppCompatActivity() {
                                 gridMask, gSize,
                                 cropXFull, cropYFull, minDimFull,
                                 sW.toFloat(), sH.toFloat(),
-                                snapInvVp, tableY, camX, camZ, measuredHeightM
+                                snapInvVp, tableY, snapCamX, snapCamZ, measuredHeightM
                             )
                         } else {
                             handlePreLockMiss()
@@ -823,14 +901,14 @@ class MainActivity : AppCompatActivity() {
                     } finally {
                         isPreLockMlRunning = false
                     }
-                }.start()
+                }
             },
             mainHandler
         )
     }
 
     /**
-     * Runs U2Net-P (NHWC [1,320,320,3] or NCHW [1,3,320,320]) with ImageNet normalization
+     * Runs U2Net-P (GPU-accelerated on u2netExecutor) using pre-allocated ByteBuffers
      * and returns a clean binary salient mask on a 96x96 grid.
      */
     private fun runU2NetSaliencyMask(interp: Interpreter, squareBmp: Bitmap): Pair<BooleanArray, Int>? {
@@ -846,15 +924,22 @@ class MainActivity : AppCompatActivity() {
             Bitmap.createScaledBitmap(squareBmp, inW, inH, true)
         }
 
-        val inputBuf = ByteBuffer.allocateDirect(inTensor.numBytes()).order(ByteOrder.nativeOrder())
-        val pixels = IntArray(inW * inH)
+        val inputBuf = u2netInputBuf ?: ByteBuffer.allocateDirect(inTensor.numBytes()).order(ByteOrder.nativeOrder()).also {
+            u2netInputBuf = it
+        }
+        inputBuf.clear()
+
+        val pixCount = inW * inH
+        val pixels = u2netPixelBuf?.takeIf { it.size == pixCount } ?: IntArray(pixCount).also {
+            u2netPixelBuf = it
+        }
         scaled.getPixels(pixels, 0, inW, 0, 0, inW, inH)
         if (scaled !== squareBmp) scaled.recycle()
 
         val inv255 = 1f / 255f
         if (!isNchw) {
-            // NHWC [1, H, W, 3] (matches u2netp_d0_320_fp16.tflite)
-            for (px in pixels) {
+            for (i in 0 until pixCount) {
+                val px = pixels[i]
                 val r = ((px shr 16) and 0xFF) * inv255
                 val g = ((px shr 8) and 0xFF) * inv255
                 val b = (px and 0xFF) * inv255
@@ -863,17 +948,15 @@ class MainActivity : AppCompatActivity() {
                 inputBuf.putFloat((b - 0.406f) / 0.225f)
             }
         } else {
-            // NCHW [1, 3, H, W]
-            val plane = inW * inH
-            for (i in 0 until plane) {
+            for (i in 0 until pixCount) {
                 val r = ((pixels[i] shr 16) and 0xFF) * inv255
                 inputBuf.putFloat((r - 0.485f) / 0.229f)
             }
-            for (i in 0 until plane) {
+            for (i in 0 until pixCount) {
                 val g = ((pixels[i] shr 8) and 0xFF) * inv255
                 inputBuf.putFloat((g - 0.456f) / 0.224f)
             }
-            for (i in 0 until plane) {
+            for (i in 0 until pixCount) {
                 val b = (pixels[i] and 0xFF) * inv255
                 inputBuf.putFloat((b - 0.406f) / 0.225f)
             }
@@ -882,7 +965,10 @@ class MainActivity : AppCompatActivity() {
 
         val outTensor = interp.getOutputTensor(0)
         val outShape = outTensor.shape()
-        val outputBuf = ByteBuffer.allocateDirect(outTensor.numBytes()).order(ByteOrder.nativeOrder())
+        val outputBuf = u2netOutputBuf ?: ByteBuffer.allocateDirect(outTensor.numBytes()).order(ByteOrder.nativeOrder()).also {
+            u2netOutputBuf = it
+        }
+        outputBuf.clear()
 
         interp.run(inputBuf, outputBuf)
         outputBuf.rewind()
@@ -907,7 +993,6 @@ class MainActivity : AppCompatActivity() {
             if (v > maxV) maxV = v
         }
 
-        // If raw logits (outside [0, 1]), apply sigmoid first
         val needsSigmoid = (minV < -0.05f || maxV > 1.05f)
         if (needsSigmoid) {
             minV = Float.MAX_VALUE; maxV = -Float.MAX_VALUE
@@ -937,9 +1022,6 @@ class MainActivity : AppCompatActivity() {
         return Pair(gridMask, gSize)
     }
 
-    /**
-     * Fallback pre-lock neural mask using MagicTouch if u2netp.tflite hasn't been added yet.
-     */
     private fun runMagicTouchMaskOnly(
         interp: Interpreter,
         squareBmp: Bitmap,
@@ -1039,16 +1121,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handlePreLockMiss() {
+        // Instant release on pan-away (no multi-second off-screen freeze)
         liveClingMissCount++
-        if (liveClingMissCount >= 3) {
+        if (liveClingMissCount >= 1) {
             hasLiveCling = false
         }
     }
 
-    /**
-     * Finds the salient connected component nearest the aiming crosshair, computes its
-     * Rotating-Calipers 2D fit, and unprojects onto the strict table plane (with mid-height centering).
-     */
     private fun applyPreLockMaskToLiveRing(
         gridMask: BooleanArray,
         gSize: Int,
@@ -1117,7 +1196,6 @@ class MainActivity : AppCompatActivity() {
                 val distNorm = sqrt((meanGX - centerG).pow(2) + (meanGY - centerG).pow(2)) / gSize
                 if (distNorm > 0.36f) continue
 
-                // Prefer the salient component closest to the aiming crosshair (magnetic cling!)
                 val score = (1.0f - distNorm * 2.4f) + ln(cnt.toFloat()) * 0.08f
                 if (score > bestScore) {
                     bestScore = score
@@ -1136,7 +1214,6 @@ class MainActivity : AppCompatActivity() {
         val barX = sumX / count
         val barY = sumY / count
 
-        // 2° Rotating-Calipers Minimum-Area Bounding Box on the U2Net-P neural silhouette
         var bestArea = Float.MAX_VALUE
         var bestRad = 0f
         for (deg in 0 until 90 step 2) {
@@ -1248,7 +1325,12 @@ class MainActivity : AppCompatActivity() {
 
         liveClingMissCount = 0
 
-        if (!hasLiveCling) {
+        // Snap 100% immediately on first lock, target switch (>6cm jump), or major scale shift (>45%)
+        val posJump = sqrt((pCenterMid[0] - liveWorldX).pow(2) + (pCenterMid[2] - liveWorldZ).pow(2))
+        val prevArea = (liveWidth * liveDepth).coerceAtLeast(1e-4f)
+        val areaRatio = abs((targetW * targetD) - prevArea) / prevArea
+
+        if (!hasLiveCling || posJump > 0.06f || areaRatio > 0.45f) {
             liveWorldX = pCenterMid[0]
             liveWorldY = tableY
             liveWorldZ = pCenterMid[2]
@@ -1262,17 +1344,18 @@ class MainActivity : AppCompatActivity() {
             liveClingScreenY = boxScreenCY
             hasLiveCling = true
         } else {
-            val alphaPos = 0.45f
-            val alphaDim = 0.35f
+            // Fast, responsive tracking with zero slow shrink-down creep
+            val alphaPos = 0.85f
+            val alphaDim = 0.82f
             liveWorldX += alphaPos * (pCenterMid[0] - liveWorldX)
-            liveWorldY = tableY // Strictly glued to table plane (0 float!)
+            liveWorldY = tableY
             liveWorldZ += alphaPos * (pCenterMid[2] - liveWorldZ)
             liveWidth += alphaDim * (targetW - liveWidth)
             liveDepth += alphaDim * (targetD - liveDepth)
             liveHeight += alphaDim * (targetH - liveHeight)
 
-            liveCos2A = liveCos2A * 0.68f + cos(targetHeading * 2f) * 0.32f
-            liveSin2A = liveSin2A * 0.68f + sin(targetHeading * 2f) * 0.32f
+            liveCos2A = liveCos2A * 0.25f + cos(targetHeading * 2f) * 0.75f
+            liveSin2A = liveSin2A * 0.25f + sin(targetHeading * 2f) * 0.75f
             var smoothedAxis = 0.5f * atan2(liveSin2A, liveCos2A)
             if (sin(smoothedAxis) * camDirX + cos(smoothedAxis) * camDirZ < 0f) {
                 smoothedAxis += Math.PI.toFloat()
@@ -1309,7 +1392,7 @@ class MainActivity : AppCompatActivity() {
             initialAzimuth = liveAzimuth
             seedScreenX = liveClingScreenX
             seedScreenY = liveClingScreenY
-            logDebug("✓ Locked U2Net-P Seed: ${(prismWidth * 100).roundToInt()}x${(prismDepth * 100).roundToInt()}x${(prismHeight * 100).roundToInt()}cm")
+            logDebug("✓ Locked U2Net-P Seed (${lastPreLockLatencyMs}ms): ${(prismWidth * 100).roundToInt()}x${(prismDepth * 100).roundToInt()}x${(prismHeight * 100).roundToInt()}cm")
         } else {
             anchor = createStabilizedTableAnchor(tablePose.tx(), tableY, tablePose.tz())
             val camPose = frame.camera.pose
@@ -1412,14 +1495,12 @@ class MainActivity : AppCompatActivity() {
                             val normU2X = ((seedScreenX - cropX) / minDim).coerceIn(0.15f, 0.85f)
                             val normU2Y = ((seedScreenY - cropY) / minDim).coerceIn(0.15f, 0.85f)
 
-                            // Prompt 1: Exact U2Net-P neural centroid
                             val okPrimary = runSingleMagicTouchRefine(
                                 interp, squareBmp, normU2X, normU2Y,
                                 cropX, cropY, minDim.toFloat(),
                                 invVpMatrix, snapshotAnchorPose, camAngle, seedHeightM, sWidth, sHeight
                             )
 
-                            // Prompt 2 (Fallback): Exact center crosshair (0.5, 0.5)
                             if (!okPrimary) {
                                 runSingleMagicTouchRefine(
                                     interp, squareBmp, 0.5f, 0.5f,
@@ -1737,7 +1818,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         runOnUiThread {
-            // 100% Authority: MagicTouch directly sets the true center, scale, and orientation
             try {
                 val currentAnchor = prismAnchor
                 if (currentAnchor != null) {
@@ -1834,6 +1914,14 @@ class MainActivity : AppCompatActivity() {
         camera.getProjectionMatrix(frameProjMatrix, 0, 0.05f, 50.0f)
         Matrix.multiplyMM(frameVpMatrix, 0, frameProjMatrix, 0, frameViewMatrix, 0)
 
+        val camPoseNow = camera.pose
+        liveCamX = camPoseNow.tx()
+        liveCamY = camPoseNow.ty()
+        liveCamZ = camPoseNow.tz()
+        liveCamFwdX = -camPoseNow.zAxis[0]
+        liveCamFwdY = -camPoseNow.zAxis[1]
+        liveCamFwdZ = -camPoseNow.zAxis[2]
+
         val now = System.currentTimeMillis()
         val shouldUpdateHud = (now - lastHudUpdateMs) >= 100L
 
@@ -1841,10 +1929,10 @@ class MainActivity : AppCompatActivity() {
             val (tablePlane, tablePose) = resolveStrictTableSurface(frame)
 
             if (tablePlane != null && tablePose != null) {
-                // Keep live ring base locked 1:1 to tracked table plane Y on every frame
                 liveWorldY = tablePlane.centerPose.ty()
 
-                if (!isPreLockMlRunning && (now - lastPreLockMlTriggerMs) >= 160L) {
+                // 50ms cadence allows smooth ~10-15 FPS live updates on GPU
+                if (!isPreLockMlRunning && (now - lastPreLockMlTriggerMs) >= 50L) {
                     triggerPreLockNeuralCling(frame, tablePose)
                 }
             } else {
@@ -1856,7 +1944,14 @@ class MainActivity : AppCompatActivity() {
 
             if (shouldUpdateHud) {
                 lastHudUpdateMs = now
-                val tag = if (u2netInterpreter != null) "U2NET" else "AI"
+                val tag = when {
+                    u2netInterpreter != null && u2netUsingGpu -> "U2NET-GPU"
+                    u2netInterpreter != null -> "U2NET-CPU"
+                    else -> "AI"
+                }
+                if (lastPreLockLatencyMs > 0L) {
+                    setTextIfChanged(valAlign, "ML: ${lastPreLockLatencyMs}ms")
+                }
                 if (hasLiveCling && tablePlane != null) {
                     val wCm = (liveWidth * 100).roundToInt()
                     val dCm = (liveDepth * 100).roundToInt()
