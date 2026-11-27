@@ -85,14 +85,15 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.8.2")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
 
-    // Exact Sceneview & ARCore engine matching MainActivity.kt
+    // ARCore & Sceneview
     implementation("com.google.ar:core:1.41.0")
     implementation("io.github.sceneview:arsceneview:2.2.1")
 
-    // TFLite Runtime + GPU Delegate for real-time u2netp.tflite & magic_touch.tflite
+    // Real-time Pre-Lock Object Detection & Tracking (STREAM_MODE)
+    implementation("com.google.mlkit:object-detection:17.0.2")
+
+    // One-Shot Lock Precision Segmentation (magic_touch.tflite)
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
-    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
 
     // Networking for Modal Batch Upload
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
