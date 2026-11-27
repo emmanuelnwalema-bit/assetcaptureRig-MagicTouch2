@@ -25,11 +25,6 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.DetectedObject
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.ObjectDetector
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import io.github.sceneview.ar.ARSceneView
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -91,25 +86,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (ML Kit Live Tracking + MagicTouch Lock)\n")
+    private val debugLog = StringBuilder("App Initialized (60 FPS ARCore + Pause Auto-Snap MagicTouch)\n")
     private var toneGen: ToneGenerator? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // =========================================================
-    // HYBRID PIPELINE: ML KIT STREAM_MODE (LIVE) -> MAGICTOUCH (LOCK)
+    // SINGLE-THREADED NON-BLOCKING MAGICTOUCH ENGINE (CPU-XNNPACK)
     // =========================================================
-    private var objectDetector: ObjectDetector? = null
-    @Volatile private var isPreLockMlRunning = false
-    @Volatile private var lastPreLockLatencyMs = 0L
-    private var lastPreLockMlTriggerMs = 0L
-    private var lastTrackedObjectId: Int? = null
-    private var liveClingMissCount = 0
-
-    // Single-threaded worker for one-shot MagicTouch refinement on Lock
     private val mlExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     @Volatile private var magicTouchInterpreter: Interpreter? = null
     private val magicTouchAssetName = "magic_touch.tflite"
 
+    // Pre-allocated reusable buffers (accessed strictly on mlExecutor)
     private var mtInH = 512
     private var mtInW = 512
     private var mtInC = 4
@@ -121,8 +109,32 @@ class MainActivity : AppCompatActivity() {
     private var mtPixelBuf: IntArray? = null
     private var mtFloatInput: FloatArray? = null
     private var mtFloatOutput: FloatArray? = null
+    private var centerGaussMap: FloatArray? = null
 
-    // Live camera pose snapshot for stale-frame rejection
+    @Volatile private var isAutoSnapRunning = false
+    @Volatile private var lastSnapLatencyMs = 0L
+    private var preLockCopyBmp: Bitmap? = null
+
+    // =========================================================
+    // 60 FPS DWELL DETECTOR & WORLD-PINNED PRE-LOCK ANCHOR
+    // =========================================================
+    private val dwellDurationMs = 160L
+    private var hasDwellRef = false
+    private var dwellStartMs = 0L
+    private var dwellRefX = 0f
+    private var dwellRefZ = 0f
+    private var dwellFwdX = 0f
+    private var dwellFwdY = 0f
+    private var dwellFwdZ = -1f
+    private var dwellProgress = 0f
+
+    // Prevents repeatedly firing MagicTouch on the same empty table spot
+    private var hasFailedSpot = false
+    private var failedSpotX = 0f
+    private var failedSpotZ = 0f
+    private var failedSpotTimeMs = 0L
+
+    // Live camera pose for stale-frame rejection during auto-snap
     @Volatile private var liveCamX = 0f
     @Volatile private var liveCamY = 0f
     @Volatile private var liveCamZ = 0f
@@ -135,6 +147,7 @@ class MainActivity : AppCompatActivity() {
     private var isCapturing = false
     private var isBatchUploading = false
     private var lastFrame: Frame? = null
+    private var preLockAnchor: Anchor? = null
     private var prismAnchor: Anchor? = null
     private var trackedTablePlane: Plane? = null
     private var initialAzimuth = 0f
@@ -158,7 +171,7 @@ class MainActivity : AppCompatActivity() {
     private var prismHeight = 0.05f
 
     // =========================================================
-    // 3D ENCAPSULATING RING LIVE CLING STATE (DRIVEN BY ML KIT)
+    // WORLD-PINNED PRE-LOCK RING STATE (SET BY AUTO-SNAP MAGICTOUCH)
     // =========================================================
     @Volatile private var hasLiveCling = false
     @Volatile private var liveWorldX = 0f
@@ -168,8 +181,6 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var liveDepth = 0.10f
     @Volatile private var liveHeight = 0.045f
     @Volatile private var liveAzimuth = 0f
-    @Volatile private var liveClingScreenX = 0f
-    @Volatile private var liveClingScreenY = 0f
 
     private val capturedThumbnails = mutableMapOf<Int, Bitmap>()
     private val previewCardViews = mutableListOf<ImageView>()
@@ -243,7 +254,6 @@ class MainActivity : AppCompatActivity() {
             toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
         } catch (e: Exception) {}
 
-        initMlKitObjectDetector()
         initMagicTouchModel()
 
         overlayView = PrismOverlayView(this)
@@ -317,9 +327,10 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         try {
+            preLockAnchor?.detach()
+            preLockAnchor = null
             prismAnchor?.detach()
-            objectDetector?.close()
-            objectDetector = null
+            prismAnchor = null
             mlExecutor.execute {
                 try { magicTouchInterpreter?.close() } catch (_: Exception) {}
                 magicTouchInterpreter = null
@@ -362,26 +373,11 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("ML Kit + MagicTouch Diagnostics")
+                .setTitle("Auto-Snap MagicTouch Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
                 .show()
-        }
-    }
-
-    private fun initMlKitObjectDetector() {
-        try {
-            // STREAM_MODE + enableMultipleObjects (no classification) keeps detection fast,
-            // class-agnostic, and allows selecting the object closest to the center aim dot.
-            val options = ObjectDetectorOptions.Builder()
-                .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
-                .enableMultipleObjects()
-                .build()
-            objectDetector = ObjectDetection.getClient(options)
-            logDebug("✓ ML Kit ObjectDetector Ready [STREAM_MODE, Class-Agnostic]")
-        } catch (e: Exception) {
-            logDebug("❌ ML Kit Init Failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -423,6 +419,22 @@ class MainActivity : AppCompatActivity() {
                     for (d in mtOutShape) outElems *= d
                     mtFloatOutput = FloatArray(outElems)
                 }
+
+                // Pre-compute center (0.5, 0.5) Gaussian prompt map once to eliminate 262k exp() calls per snap
+                val gMap = FloatArray(mtInW * mtInH)
+                val cx = mtInW * 0.5f
+                val cy = mtInH * 0.5f
+                val invTwoSigmaSq = 1.0f / (2.0f * 12.0f * 12.0f)
+                var idx = 0
+                for (y in 0 until mtInH) {
+                    val dy = y - cy
+                    val dySq = dy * dy
+                    for (x in 0 until mtInW) {
+                        val dx = x - cx
+                        gMap[idx++] = exp(-(dx * dx + dySq) * invTwoSigmaSq)
+                    }
+                }
+                centerGaussMap = gMap
 
                 magicTouchInterpreter = interp
                 logDebug("✓ MagicTouch Ready [CPU-XNNPACK]! In:${inShape.contentToString()} Out:${mtOutShape.contentToString()}")
@@ -567,7 +579,7 @@ class MainActivity : AppCompatActivity() {
             return Pair(rootPlane, pose)
         }
 
-        // Center ray hit the elevated asset -> cast 8 perimeter rays on the table surrounding it
+        // Center ray hit the elevated asset -> cast 8 perimeter rays on the surrounding table
         val minDim = min(sW, sH)
         val ringR = minDim * 0.28f
         val planeVotes = mutableMapOf<Plane, Int>()
@@ -778,271 +790,16 @@ class MainActivity : AppCompatActivity() {
         return Pose(floatArrayOf(stableAnchorX, stableAnchorY, stableAnchorZ), floatArrayOf(0f, 0f, 0f, 1f))
     }
 
-    // =========================================================================
-    // PHASE 1: REAL-TIME ML KIT OBJECT DETECTION & TRACKING (PRE-LOCK ~30 FPS)
-    // =========================================================================
-    private fun triggerPreLockMlKitDetector(frame: Frame, tablePose: Pose) {
-        val detector = objectDetector ?: return
-        val sW = sceneView.width.toFloat()
-        val sH = sceneView.height.toFloat()
-        if (sW <= 0f || sH <= 0f || isPreLockMlRunning) return
-
-        val mediaImage: Image = try {
-            frame.acquireCameraImage()
-        } catch (_: Exception) {
-            return
-        }
-
-        val imgW = mediaImage.width
-        val imgH = mediaImage.height
-
-        // Synchronously snapshot the exact ARCore IMAGE_PIXELS -> VIEW affine transform
-        val imgBasis = floatArrayOf(0f, 0f, imgW.toFloat(), 0f, 0f, imgH.toFloat())
-        val viewBasis = FloatArray(6)
-        try {
-            frame.transformCoordinates2d(
-                Coordinates2d.IMAGE_PIXELS, imgBasis,
-                Coordinates2d.VIEW, viewBasis
-            )
-        } catch (_: Exception) {
-            mediaImage.close()
-            return
-        }
-
-        val ox = viewBasis[0]
-        val oy = viewBasis[1]
-        val uxX = (viewBasis[2] - ox) / imgW.toFloat()
-        val uxY = (viewBasis[3] - oy) / imgW.toFloat()
-        val uyX = (viewBasis[4] - ox) / imgH.toFloat()
-        val uyY = (viewBasis[5] - oy) / imgH.toFloat()
-
-        // Derive the exact upright rotation degrees for ML Kit directly from ARCore's sensor->screen basis
-        val rotationDegrees = if (abs(uxY) >= abs(uxX)) {
-            if (uxY > 0f) 90 else 270
-        } else {
-            if (uxX > 0f) 0 else 180
-        }
-
-        val snapVp = frameVpMatrix.copyOf()
-        val snapInvVp = FloatArray(16)
-        if (!Matrix.invertM(snapInvVp, 0, snapVp, 0)) {
-            mediaImage.close()
-            return
-        }
-
-        val tableY = tablePose.ty()
-        val camPose = frame.camera.pose
-        val snapCamX = camPose.tx()
-        val snapCamY = camPose.ty()
-        val snapCamZ = camPose.tz()
-        val snapFwdX = -camPose.zAxis[0]
-        val snapFwdY = -camPose.zAxis[1]
-        val snapFwdZ = -camPose.zAxis[2]
-
-        val probeScreenX = if (hasLiveCling) liveClingScreenX else sW * 0.5f
-        val probeScreenY = if (hasLiveCling) liveClingScreenY else sH * 0.5f
-        val probeWorldX = if (hasLiveCling) liveWorldX else tablePose.tx()
-        val probeWorldZ = if (hasLiveCling) liveWorldZ else tablePose.tz()
-        val measuredHeightM = measureObjectHeightSync(
-            frame, tableY, probeScreenX, probeScreenY, probeWorldX, probeWorldZ, max(liveWidth, liveDepth) * 0.65f
-        )
-
-        val inputImage = try {
-            InputImage.fromMediaImage(mediaImage, rotationDegrees)
-        } catch (e: Exception) {
-            mediaImage.close()
-            return
-        }
-
-        isPreLockMlRunning = true
-        lastPreLockMlTriggerMs = System.currentTimeMillis()
-        val startMs = lastPreLockMlTriggerMs
-
-        detector.process(inputImage)
-            .addOnSuccessListener { detectedObjects ->
-                lastPreLockLatencyMs = System.currentTimeMillis() - startMs
-                if (isBoxPlaced) return@addOnSuccessListener
-
-                // Drop stale detection only on very fast camera whips (> 18° turn or > 10cm shift)
-                val rotDot = snapFwdX * liveCamFwdX + snapFwdY * liveCamFwdY + snapFwdZ * liveCamFwdZ
-                val camShift = sqrt(
-                    (liveCamX - snapCamX).pow(2) +
-                        (liveCamY - snapCamY).pow(2) +
-                        (liveCamZ - snapCamZ).pow(2)
-                )
-                if (rotDot < 0.951f || camShift > 0.10f) return@addOnSuccessListener
-
-                processMlKitDetections(
-                    detectedObjects = detectedObjects,
-                    imgW = imgW,
-                    imgH = imgH,
-                    rotationDegrees = rotationDegrees,
-                    ox = ox, oy = oy,
-                    uxX = uxX, uxY = uxY,
-                    uyX = uyX, uyY = uyY,
-                    sWidth = sW,
-                    sHeight = sH,
-                    invVpMatrix = snapInvVp,
-                    tableY = tableY,
-                    camX = snapCamX,
-                    camZ = snapCamZ,
-                    measuredHeightM = measuredHeightM
-                )
-            }
-            .addOnFailureListener { e ->
-                logDebug("⚠️ ML Kit Err: ${e.message}")
-            }
-            .addOnCompleteListener {
-                try { mediaImage.close() } catch (_: Exception) {}
-                isPreLockMlRunning = false
-            }
-    }
-
-    private fun processMlKitDetections(
-        detectedObjects: List<DetectedObject>,
-        imgW: Int,
-        imgH: Int,
-        rotationDegrees: Int,
-        ox: Float, oy: Float,
-        uxX: Float, uxY: Float,
-        uyX: Float, uyY: Float,
-        sWidth: Float,
-        sHeight: Float,
-        invVpMatrix: FloatArray,
-        tableY: Float,
-        camX: Float,
-        camZ: Float,
-        measuredHeightM: Float
-    ) {
-        fun mlKitPointToScreen(mx: Float, my: Float): Pair<Float, Float> {
-            val rx: Float
-            val ry: Float
-            when (rotationDegrees) {
-                90 -> { rx = my; ry = imgH - 1f - mx }
-                180 -> { rx = imgW - 1f - mx; ry = imgH - 1f - my }
-                270 -> { rx = imgW - 1f - my; ry = mx }
-                else -> { rx = mx; ry = my }
-            }
-            val sx = ox + rx * uxX + ry * uyX
-            val sy = oy + rx * uxY + ry * uyY
-            return Pair(sx, sy)
-        }
-
-        val aimX = sWidth * 0.5f
-        val aimY = sHeight * 0.5f
-        val minDim = min(sWidth, sHeight)
-        val screenArea = (sWidth * sHeight).coerceAtLeast(1f)
-
-        var bestObj: DetectedObject? = null
-        var bestRect: RectF? = null
-        var bestScore = -Float.MAX_VALUE
-
-        for (obj in detectedObjects) {
-            val b = obj.boundingBox
-            val (x1, y1) = mlKitPointToScreen(b.left.toFloat(), b.top.toFloat())
-            val (x2, y2) = mlKitPointToScreen(b.right.toFloat(), b.bottom.toFloat())
-            val rect = RectF(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-
-            val bw = rect.width()
-            val bh = rect.height()
-            val areaFrac = (bw * bh) / screenArea
-            if (bw < 32f || bh < 32f || areaFrac > 0.68f) continue
-            if (bw > sWidth * 0.90f && bh > sHeight * 0.82f) continue
-
-            val cx = rect.centerX()
-            val cy = rect.centerY()
-            val distNorm = sqrt((cx - aimX).pow(2) + (cy - aimY).pow(2)) / minDim
-            val containsAim = rect.contains(aimX, aimY)
-
-            // Require object to contain the aim dot or sit magnetically close to center
-            if (!containsAim && distNorm > 0.30f) continue
-
-            val trackBonus = if (obj.trackingId != null && obj.trackingId == lastTrackedObjectId) 0.18f else 0f
-            val containBonus = if (containsAim) 0.55f else 0f
-            val score = containBonus + trackBonus - distNorm * 1.8f - areaFrac * 0.25f
-
-            if (score > bestScore) {
-                bestScore = score
-                bestObj = obj
-                bestRect = rect
-            }
-        }
-
-        val chosen = bestObj
-        val rect = bestRect
-        if (chosen == null || rect == null) {
-            liveClingMissCount++
-            if (liveClingMissCount >= 2) {
-                hasLiveCling = false
-                lastTrackedObjectId = null
-            }
-            return
-        }
-
-        val boxCX = rect.centerX()
-        val boxCY = rect.centerY()
-        val estHeight = if (measuredHeightM > 0.015f) measuredHeightM else liveHeight
-        val estMidY = tableY + estHeight * 0.5f
-
-        val pCenter = intersectScreenRayWithHorizontalPlane(boxCX, boxCY, sWidth, sHeight, invVpMatrix, estMidY)
-        val pLeft = intersectScreenRayWithHorizontalPlane(rect.left, boxCY, sWidth, sHeight, invVpMatrix, estMidY)
-        val pRight = intersectScreenRayWithHorizontalPlane(rect.right, boxCY, sWidth, sHeight, invVpMatrix, estMidY)
-        val pTop = intersectScreenRayWithHorizontalPlane(boxCX, rect.top, sWidth, sHeight, invVpMatrix, estMidY)
-        val pBottom = intersectScreenRayWithHorizontalPlane(boxCX, rect.bottom, sWidth, sHeight, invVpMatrix, estMidY)
-
-        if (pCenter == null || pLeft == null || pRight == null || pTop == null || pBottom == null) {
-            liveClingMissCount++
-            if (liveClingMissCount >= 2) hasLiveCling = false
-            return
-        }
-
-        val spanW = sqrt((pRight[0] - pLeft[0]).pow(2) + (pRight[2] - pLeft[2]).pow(2)).coerceIn(0.04f, 0.45f)
-        val spanD = sqrt((pBottom[0] - pTop[0]).pow(2) + (pBottom[2] - pTop[2]).pow(2)).coerceIn(0.04f, 0.45f)
-        val camHeading = atan2(camX - pCenter[0], camZ - pCenter[2])
-
-        val targetW = (spanW * 1.04f).coerceIn(0.04f, 0.45f)
-        val targetD = (spanD * 1.04f).coerceIn(0.04f, 0.45f)
-        val targetH = if (measuredHeightM > 0.015f) {
-            measuredHeightM
-        } else {
-            (min(targetW, targetD) * 0.45f).coerceIn(0.03f, 0.14f)
-        }
-
-        liveClingMissCount = 0
-        val switchedObject = (chosen.trackingId != null && chosen.trackingId != lastTrackedObjectId)
-        lastTrackedObjectId = chosen.trackingId
-
-        val posJump = sqrt((pCenter[0] - liveWorldX).pow(2) + (pCenter[2] - liveWorldZ).pow(2))
-
-        if (!hasLiveCling || switchedObject || posJump > 0.06f) {
-            liveWorldX = pCenter[0]
-            liveWorldY = tableY
-            liveWorldZ = pCenter[2]
-            liveWidth = targetW
-            liveDepth = targetD
-            liveHeight = targetH
-            liveAzimuth = camHeading
-            liveClingScreenX = boxCX
-            liveClingScreenY = boxCY
-            hasLiveCling = true
-        } else {
-            // Fast 30 FPS tracking: responsive to movement while smoothing 1-2px detector jitter
-            val alphaPos = 0.55f
-            val alphaDim = 0.45f
-            liveWorldX += alphaPos * (pCenter[0] - liveWorldX)
-            liveWorldY = tableY
-            liveWorldZ += alphaPos * (pCenter[2] - liveWorldZ)
-            liveWidth += alphaDim * (targetW - liveWidth)
-            liveDepth += alphaDim * (targetD - liveDepth)
-            liveHeight += alphaDim * (targetH - liveHeight)
-            liveAzimuth = camHeading
-            liveClingScreenX += alphaPos * (boxCX - liveClingScreenX)
-            liveClingScreenY += alphaPos * (boxCY - liveClingScreenY)
-        }
+    private fun releasePreLockPin() {
+        hasLiveCling = false
+        try { preLockAnchor?.detach() } catch (_: Exception) {}
+        preLockAnchor = null
+        hasDwellRef = false
+        dwellProgress = 0f
     }
 
     // =========================================================================
-    // PHASE 2: STRICT TABLE-GROUNDED LOCK + ONE-SHOT MAGICTOUCH REFINEMENT
+    // PHASE 1: PAUSE-TRIGGERED AUTO-SNAP MAGICTOUCH (WORLD-PINNED AT 60 FPS)
     // =========================================================================
     private data class MagicTouch3DFit(
         val worldX: Float,
@@ -1054,6 +811,173 @@ class MainActivity : AppCompatActivity() {
         val screenCY: Float
     )
 
+    private fun triggerAutoSnapMagicTouch(frame: Frame, tablePose: Pose) {
+        val sW = sceneView.width
+        val sH = sceneView.height
+        if (sW <= 0 || sH <= 0 || isAutoSnapRunning || isBoxPlaced) return
+        if (magicTouchInterpreter == null) return
+
+        isAutoSnapRunning = true
+
+        val snapVp = frameVpMatrix.copyOf()
+        val snapInvVp = FloatArray(16)
+        if (!Matrix.invertM(snapInvVp, 0, snapVp, 0)) {
+            isAutoSnapRunning = false
+            return
+        }
+
+        val tableY = tablePose.ty()
+        val aimWorldX = tablePose.tx()
+        val aimWorldZ = tablePose.tz()
+        val camPose = frame.camera.pose
+        val snapCamX = camPose.tx()
+        val snapCamY = camPose.ty()
+        val snapCamZ = camPose.tz()
+        val snapFwdX = -camPose.zAxis[0]
+        val snapFwdY = -camPose.zAxis[1]
+        val snapFwdZ = -camPose.zAxis[2]
+
+        val measuredHeightM = measureObjectHeightSync(
+            frame, tableY, sW * 0.5f, sH * 0.5f, aimWorldX, aimWorldZ, 0.14f
+        )
+
+        // Downscale PixelCopy directly to 512 on the short axis (avoids full-res copy + rescale)
+        val targetW: Int
+        val targetH: Int
+        if (sW <= sH) {
+            targetW = mtInW
+            targetH = max(mtInH, (mtInW.toFloat() * sH / sW).roundToInt())
+        } else {
+            targetH = mtInH
+            targetW = max(mtInW, (mtInH.toFloat() * sW / sH).roundToInt())
+        }
+        if (preLockCopyBmp == null || preLockCopyBmp!!.width != targetW || preLockCopyBmp!!.height != targetH) {
+            preLockCopyBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+        }
+        val destBmp = preLockCopyBmp!!
+
+        PixelCopy.request(
+            sceneView as SurfaceView,
+            destBmp,
+            PixelCopy.OnPixelCopyFinishedListener { copyResult ->
+                if (copyResult != PixelCopy.SUCCESS || isBoxPlaced) {
+                    isAutoSnapRunning = false
+                    return@OnPixelCopyFinishedListener
+                }
+
+                val bmpCopy = destBmp.copy(Bitmap.Config.ARGB_8888, false)
+                mlExecutor.execute {
+                    var squareSmall: Bitmap? = null
+                    try {
+                        val interp = magicTouchInterpreter ?: return@execute
+                        if (isBoxPlaced) return@execute
+
+                        val t0 = System.currentTimeMillis()
+                        val minDimSmall = min(bmpCopy.width, bmpCopy.height)
+                        val cropXSmall = (bmpCopy.width - minDimSmall) / 2
+                        val cropYSmall = (bmpCopy.height - minDimSmall) / 2
+                        squareSmall = Bitmap.createBitmap(bmpCopy, cropXSmall, cropYSmall, minDimSmall, minDimSmall)
+
+                        val minDimFull = min(sW, sH).toFloat()
+                        val cropXFull = (sW - minDimFull) * 0.5f
+                        val cropYFull = (sH - minDimFull) * 0.5f
+                        val estHeight = if (measuredHeightM > 0.015f) measuredHeightM else 0.045f
+
+                        val fit = runMagicTouchSolveOnWorker(
+                            interp = interp,
+                            squareBmp = squareSmall,
+                            normKeyX = 0.5f,
+                            normKeyY = 0.5f,
+                            cropXFull = cropXFull,
+                            cropYFull = cropYFull,
+                            minDimFull = minDimFull,
+                            sWidth = sW.toFloat(),
+                            sHeight = sH.toFloat(),
+                            invVpMatrix = snapInvVp,
+                            tableY = tableY,
+                            estHeightM = estHeight,
+                            camX = snapCamX,
+                            camZ = snapCamZ
+                        )
+                        lastSnapLatencyMs = System.currentTimeMillis() - t0
+
+                        // Discard if user whipped the camera away while snap was computing
+                        val rotDot = snapFwdX * liveCamFwdX + snapFwdY * liveCamFwdY + snapFwdZ * liveCamFwdZ
+                        val camShift = sqrt(
+                            (liveCamX - snapCamX).pow(2) +
+                                (liveCamY - snapCamY).pow(2) +
+                                (liveCamZ - snapCamZ).pow(2)
+                        )
+                        if (rotDot < 0.94f || camShift > 0.10f) {
+                            return@execute
+                        }
+
+                        runOnUiThread {
+                            if (isBoxPlaced) return@runOnUiThread
+
+                            if (fit != null) {
+                                val targetH = if (measuredHeightM > 0.015f) {
+                                    measuredHeightM
+                                } else {
+                                    (min(fit.widthM, fit.depthM) * 0.45f).coerceIn(0.03f, 0.14f)
+                                }
+
+                                // Pin the snapped object to a real ARCore table-plane Anchor (60 FPS 0-lag tracking!)
+                                val newPin = createStabilizedTableAnchor(fit.worldX, tableY, fit.worldZ)
+                                try { preLockAnchor?.detach() } catch (_: Exception) {}
+                                preLockAnchor = newPin
+
+                                if (newPin != null) {
+                                    val p = newPin.pose
+                                    liveWorldX = p.tx()
+                                    liveWorldY = p.ty()
+                                    liveWorldZ = p.tz()
+                                    resetAnchorDamper(p)
+                                } else {
+                                    liveWorldX = fit.worldX
+                                    liveWorldY = tableY
+                                    liveWorldZ = fit.worldZ
+                                }
+
+                                liveWidth = fit.widthM
+                                liveDepth = fit.depthM
+                                liveHeight = targetH
+                                liveAzimuth = fit.headingRad
+                                hasLiveCling = true
+                                hasFailedSpot = false
+                                dwellProgress = 1f
+
+                                logDebug("✓ Auto-Snapped (${lastSnapLatencyMs}ms): ${(liveWidth * 100).roundToInt()}×${(liveDepth * 100).roundToInt()}×${(liveHeight * 100).roundToInt()}cm")
+                                try {
+                                    toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP2, 60)
+                                } catch (_: Exception) {}
+                                requestOverlayRedraw()
+                            } else {
+                                // Empty table spot -> record cooldown so we don't re-fire until user moves aim
+                                hasFailedSpot = true
+                                failedSpotX = aimWorldX
+                                failedSpotZ = aimWorldZ
+                                failedSpotTimeMs = System.currentTimeMillis()
+                                hasDwellRef = false
+                                dwellProgress = 0f
+                            }
+                        }
+                    } catch (e: Exception) {
+                        logDebug("⚠️ Auto-Snap Err: ${e.message}")
+                    } finally {
+                        try { squareSmall?.recycle() } catch (_: Exception) {}
+                        try { bmpCopy.recycle() } catch (_: Exception) {}
+                        isAutoSnapRunning = false
+                    }
+                }
+            },
+            mainHandler
+        )
+    }
+
+    // =========================================================================
+    // PHASE 2: ZERO-JUMP LOCK HANDOFF (OR FALLBACK ONE-SHOT MAGICTOUCH)
+    // =========================================================================
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
         val (tablePlane, tablePose) = resolveStrictTableSurface(frame)
@@ -1064,25 +988,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         val tableY = tablePlane.centerPose.ty()
-        val seedScreenX: Float
-        val seedScreenY: Float
+        val usedAutoSnap = hasLiveCling
         val anchor: Anchor?
 
-        if (hasLiveCling) {
-            anchor = createStabilizedTableAnchor(liveWorldX, tableY, liveWorldZ)
+        if (usedAutoSnap) {
+            // Promote the already-pinned MagicTouch anchor directly (0ms instant WYSIWYG lock!)
+            val existingPin = preLockAnchor
+            if (existingPin != null && existingPin.trackingState == TrackingState.TRACKING) {
+                anchor = existingPin
+                preLockAnchor = null
+            } else {
+                try { preLockAnchor?.detach() } catch (_: Exception) {}
+                preLockAnchor = null
+                anchor = createStabilizedTableAnchor(liveWorldX, tableY, liveWorldZ)
+            }
             prismWidth = liveWidth
             prismDepth = liveDepth
             prismHeight = liveHeight
             initialAzimuth = liveAzimuth
-            seedScreenX = liveClingScreenX
-            seedScreenY = liveClingScreenY
-            logDebug("✓ Locked ML Kit Seed (${lastPreLockLatencyMs}ms): ${(prismWidth * 100).roundToInt()}x${(prismDepth * 100).roundToInt()}x${(prismHeight * 100).roundToInt()}cm")
         } else {
+            try { preLockAnchor?.detach() } catch (_: Exception) {}
+            preLockAnchor = null
             anchor = createStabilizedTableAnchor(tablePose.tx(), tableY, tablePose.tz())
             val camPose = frame.camera.pose
             initialAzimuth = atan2(camPose.tx() - tablePose.tx(), camPose.tz() - tablePose.tz())
-            seedScreenX = sceneView.width / 2f
-            seedScreenY = sceneView.height / 2f
         }
 
         if (anchor == null) {
@@ -1110,25 +1039,26 @@ class MainActivity : AppCompatActivity() {
             floatArrayOf(0f, 0f, 0f, 1f)
         )
         val camPose = frame.camera.pose
-
-        val lockHeightM = measureObjectHeightSync(
-            frame, tableY, seedScreenX, seedScreenY, snapshotAnchorPose.tx(), snapshotAnchorPose.tz(), max(prismWidth, prismDepth) * 0.7f
-        )
-        if (lockHeightM > 0.015f) {
-            prismHeight = lockHeightM
-        }
-
         overlayView.updateLockedSnapshot(vpMat, snapshotAnchorPose, camPose)
 
-        runPostLockMagicTouchConfirm(
-            invVpMat,
-            tableY,
-            camPose.tx(),
-            camPose.tz(),
-            seedScreenX,
-            seedScreenY,
-            prismHeight
-        )
+        if (usedAutoSnap) {
+            val wCm = (prismWidth * 100).roundToInt()
+            val dCm = (prismDepth * 100).roundToInt()
+            val hCm = (prismHeight * 100).roundToInt()
+            logDebug("✓ Instant WYSIWYG Lock: ${wCm}×${dCm}×${hCm}cm")
+            Toast.makeText(this, "✓ Locked: ${wCm}×${dCm}×${hCm}cm", Toast.LENGTH_SHORT).show()
+        } else {
+            // User tapped Lock before auto-snap fired -> run one-shot MagicTouch immediately
+            val lockHeightM = measureObjectHeightSync(
+                frame, tableY, sceneView.width * 0.5f, sceneView.height * 0.5f,
+                snapshotAnchorPose.tx(), snapshotAnchorPose.tz(), 0.14f
+            )
+            if (lockHeightM > 0.015f) prismHeight = lockHeightM
+
+            runFallbackLockMagicTouch(
+                invVpMat, tableY, camPose.tx(), camPose.tz(), prismHeight
+            )
+        }
 
         actionButton.visibility = View.GONE
         scaleBar.visibility = View.VISIBLE
@@ -1145,13 +1075,11 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {}
     }
 
-    private fun runPostLockMagicTouchConfirm(
+    private fun runFallbackLockMagicTouch(
         invVpMatrix: FloatArray,
         tableY: Float,
         camX: Float,
         camZ: Float,
-        seedScreenX: Float,
-        seedScreenY: Float,
         seedHeightM: Float
     ) {
         val sWidth = sceneView.width
@@ -1165,6 +1093,7 @@ class MainActivity : AppCompatActivity() {
             PixelCopy.OnPixelCopyFinishedListener { copyResult ->
                 if (copyResult == PixelCopy.SUCCESS) {
                     mlExecutor.execute {
+                        var squareBmp: Bitmap? = null
                         try {
                             val interp = magicTouchInterpreter ?: return@execute
                             val t0 = System.currentTimeMillis()
@@ -1172,17 +1101,13 @@ class MainActivity : AppCompatActivity() {
                             val minDim = min(bitmap.width, bitmap.height)
                             val cropX = (bitmap.width - minDim) / 2f
                             val cropY = (bitmap.height - minDim) / 2f
-                            val squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
+                            squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
 
-                            val normSeedX = ((seedScreenX - cropX) / minDim).coerceIn(0.15f, 0.85f)
-                            val normSeedY = ((seedScreenY - cropY) / minDim).coerceIn(0.15f, 0.85f)
-
-                            // Pass 1: Prompt at ML Kit's exact tracked object center (1° calipers sweep)
-                            var fit = runMagicTouchSolveOnWorker(
+                            val fit = runMagicTouchSolveOnWorker(
                                 interp = interp,
                                 squareBmp = squareBmp,
-                                normKeyX = normSeedX,
-                                normKeyY = normSeedY,
+                                normKeyX = 0.5f,
+                                normKeyY = 0.5f,
                                 cropXFull = cropX,
                                 cropYFull = cropY,
                                 minDimFull = minDim.toFloat(),
@@ -1194,27 +1119,6 @@ class MainActivity : AppCompatActivity() {
                                 camX = camX,
                                 camZ = camZ
                             )
-
-                            // Pass 2 (Fallback): Exact screen center (0.5, 0.5)
-                            if (fit == null && (abs(normSeedX - 0.5f) > 0.02f || abs(normSeedY - 0.5f) > 0.02f)) {
-                                fit = runMagicTouchSolveOnWorker(
-                                    interp = interp,
-                                    squareBmp = squareBmp,
-                                    normKeyX = 0.5f,
-                                    normKeyY = 0.5f,
-                                    cropXFull = cropX,
-                                    cropYFull = cropY,
-                                    minDimFull = minDim.toFloat(),
-                                    sWidth = sWidth.toFloat(),
-                                    sHeight = sHeight.toFloat(),
-                                    invVpMatrix = invVpMatrix,
-                                    tableY = tableY,
-                                    estHeightM = seedHeightM,
-                                    camX = camX,
-                                    camZ = camZ
-                                )
-                            }
-                            squareBmp.recycle()
 
                             val elapsed = System.currentTimeMillis() - t0
                             if (fit != null) {
@@ -1240,21 +1144,19 @@ class MainActivity : AppCompatActivity() {
                                     val wCm = (prismWidth * 100).roundToInt()
                                     val dCm = (prismDepth * 100).roundToInt()
                                     val hCm = (prismHeight * 100).roundToInt()
-                                    val yawDeg = Math.toDegrees(lockedFit.headingRad.toDouble()).roundToInt()
-                                    logDebug("✓ MagicTouch Refined (${elapsed}ms): ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
+                                    logDebug("✓ MagicTouch Lock (${elapsed}ms): ${wCm}×${dCm}×${hCm}cm")
                                     Toast.makeText(
                                         this@MainActivity,
                                         "✓ MagicTouch Locked: ${wCm}×${dCm}×${hCm}cm",
                                         Toast.LENGTH_SHORT
                                     ).show()
                                 }
-                            } else {
-                                logDebug("ℹ️ Kept ML Kit Lock (${elapsed}ms)")
                             }
                         } catch (e: Exception) {
                             logDebug("❌ MagicTouch Lock Err: ${e.javaClass.simpleName}: ${e.message}")
                         } finally {
-                            bitmap.recycle()
+                            try { squareBmp?.recycle() } catch (_: Exception) {}
+                            try { bitmap.recycle() } catch (_: Exception) {}
                         }
                     }
                 }
@@ -1294,6 +1196,7 @@ class MainActivity : AppCompatActivity() {
         val outputBuf = mtOutputBuf ?: return null
         inputBuf.clear()
 
+        val useCenterGauss = abs(normKeyX - 0.5f) < 0.002f && abs(normKeyY - 0.5f) < 0.002f && centerGaussMap != null
         val keyPxX = normKeyX * mtInW
         val keyPxY = normKeyY * mtInH
         val invTwoSigmaSq = 1.0f / (2.0f * 12.0f * 12.0f)
@@ -1302,37 +1205,58 @@ class MainActivity : AppCompatActivity() {
         if (mtInType == DataType.FLOAT32) {
             val fIn = mtFloatInput ?: FloatArray(pixCount * mtInC).also { mtFloatInput = it }
             var outIdx = 0
-            var pIdx = 0
-            for (y in 0 until mtInH) {
-                val dy = y - keyPxY
-                val dySq = dy * dy
-                for (x in 0 until mtInW) {
-                    val px = pixels[pIdx++]
-                    fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
-                    fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
-                    fIn[outIdx++] = (px and 0xFF) * inv255
-                    if (mtInC >= 4) {
-                        val dx = x - keyPxX
-                        fIn[outIdx++] = exp(-(dx * dx + dySq) * invTwoSigmaSq)
+            if (useCenterGauss) {
+                val gMap = centerGaussMap!!
+                if (mtInC >= 4) {
+                    for (i in 0 until pixCount) {
+                        val px = pixels[i]
+                        fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
+                        fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
+                        fIn[outIdx++] = (px and 0xFF) * inv255
+                        fIn[outIdx++] = gMap[i]
+                    }
+                } else {
+                    for (i in 0 until pixCount) {
+                        val px = pixels[i]
+                        fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
+                        fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
+                        fIn[outIdx++] = (px and 0xFF) * inv255
+                    }
+                }
+            } else {
+                var pIdx = 0
+                for (y in 0 until mtInH) {
+                    val dy = y - keyPxY
+                    val dySq = dy * dy
+                    for (x in 0 until mtInW) {
+                        val px = pixels[pIdx++]
+                        fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
+                        fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
+                        fIn[outIdx++] = (px and 0xFF) * inv255
+                        if (mtInC >= 4) {
+                            val dx = x - keyPxX
+                            fIn[outIdx++] = exp(-(dx * dx + dySq) * invTwoSigmaSq)
+                        }
                     }
                 }
             }
             inputBuf.asFloatBuffer().put(fIn)
         } else {
             var pIdx = 0
+            val gMap = if (useCenterGauss) centerGaussMap else null
             for (y in 0 until mtInH) {
                 val dy = y - keyPxY
                 val dySq = dy * dy
                 for (x in 0 until mtInW) {
-                    val px = pixels[pIdx++]
+                    val px = pixels[pIdx]
                     inputBuf.put(((px shr 16) and 0xFF).toByte())
                     inputBuf.put(((px shr 8) and 0xFF).toByte())
                     inputBuf.put((px and 0xFF).toByte())
                     if (mtInC >= 4) {
-                        val dx = x - keyPxX
-                        val g = exp(-(dx * dx + dySq) * invTwoSigmaSq)
+                        val g = gMap?.get(pIdx) ?: exp(-((x - keyPxX) * (x - keyPxX) + dySq) * invTwoSigmaSq)
                         inputBuf.put((g * 255f).toInt().coerceIn(0, 255).toByte())
                     }
+                    pIdx++
                 }
             }
         }
@@ -1408,8 +1332,8 @@ class MainActivity : AppCompatActivity() {
         val seedGY = (normKeyY * gSize).toInt().coerceIn(4, gSize - 5)
         var startIdx = -1
         var bestDist = Int.MAX_VALUE
-        for (gy in (seedGY - 10)..(seedGY + 10)) {
-            for (gx in (seedGX - 10)..(seedGX + 10)) {
+        for (gy in (seedGY - 8)..(seedGY + 8)) {
+            for (gx in (seedGX - 8)..(seedGX + 8)) {
                 if (gx in 1 until (gSize - 1) && gy in 1 until (gSize - 1)) {
                     val idx = gy * gSize + gx
                     if (gridMask[idx]) {
@@ -1463,13 +1387,14 @@ class MainActivity : AppCompatActivity() {
         val count = fgScreenX.size
         val edgeCount = (if (touchesLeft) 1 else 0) + (if (touchesRight) 1 else 0) +
             (if (touchesTop) 1 else 0) + (if (touchesBottom) 1 else 0)
-        if (count < 25 || count > (gSize * gSize * 0.68f).toInt() || edgeCount >= 3) {
+        if (count < 25 || count > (gSize * gSize * 0.65f).toInt() || edgeCount >= 3) {
             return null
         }
 
         val barX = sumX / count
         val barY = sumY / count
 
+        // Full 1° Rotating-Calipers minimum-area bounding box
         var bestArea = Float.MAX_VALUE
         var bestRad = 0f
         for (deg in 0 until 90) {
@@ -1618,6 +1543,9 @@ class MainActivity : AppCompatActivity() {
         return floatArrayOf(ray[0] + t * ray[3], planeY, ray[2] + t * ray[5])
     }
 
+    // =========================================================================
+    // 60 FPS PER-FRAME ARCORE TRACKING LOOP
+    // =========================================================================
     private fun onTrackingFrame(frame: Frame) {
         val camera = frame.camera
         if (camera.trackingState != TrackingState.TRACKING) return
@@ -1641,33 +1569,96 @@ class MainActivity : AppCompatActivity() {
             val (tablePlane, tablePose) = resolveStrictTableSurface(frame)
 
             if (tablePlane != null && tablePose != null) {
-                liveWorldY = tablePlane.centerPose.ty()
+                val tableY = tablePlane.centerPose.ty()
+                val aimX = tablePose.tx()
+                val aimZ = tablePose.tz()
 
-                // 33ms cadence targets real-time ~30 FPS ML Kit streaming
-                if (!isPreLockMlRunning && (now - lastPreLockMlTriggerMs) >= 33L) {
-                    triggerPreLockMlKitDetector(frame, tablePose)
+                if (hasLiveCling) {
+                    // World-pinned 60 FPS tracking via ARCore preLockAnchor (zero ML calls while orbiting!)
+                    val pin = preLockAnchor
+                    if (pin != null) {
+                        if (pin.trackingState == TrackingState.TRACKING) {
+                            val stablePin = getStabilizedAnchorPose(pin.pose)
+                            liveWorldX = stablePin.tx()
+                            liveWorldY = tableY
+                            liveWorldZ = stablePin.tz()
+                        } else if (pin.trackingState == TrackingState.STOPPED) {
+                            releasePreLockPin()
+                        }
+                    } else {
+                        liveWorldY = tableY
+                    }
+
+                    // Instant release back to blue 60 FPS scanner if user pans crosshair away from pinned object
+                    if (hasLiveCling) {
+                        val panDist = sqrt((aimX - liveWorldX).pow(2) + (aimZ - liveWorldZ).pow(2))
+                        val releaseRadius = max(max(liveWidth, liveDepth) * 0.85f, 0.11f)
+                        if (panDist > releaseRadius) {
+                            releasePreLockPin()
+                        }
+                    }
+                } else if (!isAutoSnapRunning) {
+                    // 60 FPS Dwell Detector: fires MagicTouch once when aim settles on an object
+                    val skipFailedSpot = hasFailedSpot &&
+                        sqrt((aimX - failedSpotX).pow(2) + (aimZ - failedSpotZ).pow(2)) < 0.045f &&
+                        (now - failedSpotTimeMs) < 1500L
+
+                    if (skipFailedSpot) {
+                        hasDwellRef = false
+                        dwellProgress = 0f
+                    } else if (!hasDwellRef) {
+                        hasDwellRef = true
+                        dwellStartMs = now
+                        dwellRefX = aimX
+                        dwellRefZ = aimZ
+                        dwellFwdX = liveCamFwdX
+                        dwellFwdY = liveCamFwdY
+                        dwellFwdZ = liveCamFwdZ
+                        dwellProgress = 0f
+                    } else {
+                        val moveDist = sqrt((aimX - dwellRefX).pow(2) + (aimZ - dwellRefZ).pow(2))
+                        val rotDot = liveCamFwdX * dwellFwdX + liveCamFwdY * dwellFwdY + liveCamFwdZ * dwellFwdZ
+
+                        if (moveDist > 0.022f || rotDot < 0.9985f) {
+                            // Still sweeping -> keep resetting dwell smoothly at 60 FPS
+                            dwellStartMs = now
+                            dwellRefX = aimX
+                            dwellRefZ = aimZ
+                            dwellFwdX = liveCamFwdX
+                            dwellFwdY = liveCamFwdY
+                            dwellFwdZ = liveCamFwdZ
+                            dwellProgress = 0f
+                        } else {
+                            val elapsed = now - dwellStartMs
+                            dwellProgress = (elapsed.toFloat() / dwellDurationMs).coerceIn(0f, 1f)
+                            if (elapsed >= dwellDurationMs && magicTouchInterpreter != null) {
+                                triggerAutoSnapMagicTouch(frame, tablePose)
+                            }
+                        }
+                    }
                 }
             } else {
-                hasLiveCling = false
-                lastTrackedObjectId = null
+                releasePreLockPin()
             }
 
-            overlayView.updatePreLockSnapshot(frameVpMatrix, tablePose)
+            overlayView.updatePreLockSnapshot(frameVpMatrix, tablePose, dwellProgress, isAutoSnapRunning)
             requestOverlayRedraw()
 
             if (shouldUpdateHud) {
                 lastHudUpdateMs = now
-                if (lastPreLockLatencyMs > 0L) {
-                    setTextIfChanged(valAlign, "DET: ${lastPreLockLatencyMs}ms")
+                if (lastSnapLatencyMs > 0L) {
+                    setTextIfChanged(valAlign, "SNAP: ${lastSnapLatencyMs}ms")
                 }
                 if (hasLiveCling && tablePlane != null) {
                     val wCm = (liveWidth * 100).roundToInt()
                     val dCm = (liveDepth * 100).roundToInt()
                     val hCm = (liveHeight * 100).roundToInt()
-                    setTextIfChanged(distIndicator, "◎ MLKIT LIVE FIT: ${wCm}×${dCm}×${hCm}cm — TAP LOCK", Color.parseColor("#3FB950"))
+                    setTextIfChanged(distIndicator, "◎ PINNED FIT: ${wCm}×${dCm}×${hCm}cm — TAP LOCK", Color.parseColor("#3FB950"))
                     setTextIfChanged(valScale, "RING: ${wCm}×${dCm}")
+                } else if (isAutoSnapRunning && tablePlane != null) {
+                    setTextIfChanged(distIndicator, "◎ SNAPPING OBJECT...", Color.parseColor("#E3B341"))
                 } else if (tablePlane != null) {
-                    setTextIfChanged(distIndicator, "TABLE PLANE LOCKED: AIM DOT AT ASSET", Color.parseColor("#58A6FF"))
+                    setTextIfChanged(distIndicator, "TABLE LOCKED: AIM & PAUSE ON ASSET", Color.parseColor("#58A6FF"))
                 } else {
                     setTextIfChanged(distIndicator, "SCANNING FOR TABLE PLANE...", Color.parseColor("#E3B341"))
                 }
@@ -1965,14 +1956,19 @@ class MainActivity : AppCompatActivity() {
         private var snapAnchorPose: Pose? = null
         private var snapCamPose: Pose? = null
         private var snapHitPose: Pose? = null
+        private var snapDwellProgress = 0f
+        private var snapIsSnapping = false
 
         private val scratchPath = Path()
         private val scratchClipVec = FloatArray(4)
         private val scratchWorldVec = FloatArray(4)
+        private val dwellArcRect = RectF()
 
-        fun updatePreLockSnapshot(vpMat: FloatArray, hitPose: Pose?) {
+        fun updatePreLockSnapshot(vpMat: FloatArray, hitPose: Pose?, dwellProg: Float, snapping: Boolean) {
             System.arraycopy(vpMat, 0, vpMatrix, 0, 16)
             snapHitPose = hitPose
+            snapDwellProgress = dwellProg
+            snapIsSnapping = snapping
             hasSnapshot = true
         }
 
@@ -2008,8 +2004,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         private val centerDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(215, 255, 255, 255)
+            color = Color.argb(220, 255, 255, 255)
             style = Paint.Style.FILL
+        }
+
+        private val dwellArcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#3FB950")
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+            strokeCap = Paint.Cap.ROUND
         }
 
         private val webXrDiskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -2101,14 +2104,24 @@ class MainActivity : AppCompatActivity() {
             val screenH = height.toFloat()
 
             // =========================================================================
-            // PRE-LOCK PHASE: TABLE-GROUNDED LIVE ML KIT 3D ENCAPSULATING RING
+            // PRE-LOCK PHASE: 60 FPS TABLE-GROUNDED RETICLE + WORLD-PINNED AUTO-SNAP
             // =========================================================================
             if (!isBoxPlaced) {
-                canvas.drawCircle(screenW / 2f, screenH / 2f, 16f, centerGuidePaint)
-                canvas.drawCircle(screenW / 2f, screenH / 2f, 4.5f, centerDotPaint)
+                val cx = screenW / 2f
+                val cy = screenH / 2f
+                canvas.drawCircle(cx, cy, 18f, centerGuidePaint)
+                canvas.drawCircle(cx, cy, 4.5f, centerDotPaint)
+
+                // Draw dwell / snapping progress arc around center aim dot
+                if (!hasLiveCling && (snapDwellProgress > 0.05f || snapIsSnapping)) {
+                    dwellArcRect.set(cx - 22f, cy - 22f, cx + 22f, cy + 22f)
+                    dwellArcPaint.color = if (snapIsSnapping) Color.parseColor("#E3B341") else Color.parseColor("#3FB950")
+                    val sweep = if (snapIsSnapping) 360f else (snapDwellProgress * 360f)
+                    canvas.drawArc(dwellArcRect, -90f, sweep, false, dwellArcPaint)
+                }
 
                 if (hasLiveCling && snapHitPose != null) {
-                    // 0.62f collar radius wraps all rectangular corners cleanly
+                    // Squarer 0.58-exponent squircle at 0.62x clears all rectangular corners cleanly
                     val rx = (liveWidth * 0.62f).coerceIn(0.028f, 0.28f)
                     val rz = (liveDepth * 0.62f).coerceIn(0.028f, 0.28f)
                     val ringH = liveHeight.coerceIn(0.028f, 0.24f)
@@ -2123,8 +2136,8 @@ class MainActivity : AppCompatActivity() {
                         val ang = (2.0 * Math.PI * i / steps)
                         val c = cos(ang)
                         val s = sin(ang)
-                        val lx = (rx * c.sign * abs(c).pow(0.82)).toFloat()
-                        val lz = (rz * s.sign * abs(s).pow(0.82)).toFloat()
+                        val lx = (rx * c.sign * abs(c).pow(0.58)).toFloat()
+                        val lz = (rz * s.sign * abs(s).pow(0.58)).toFloat()
 
                         basePts.add(projectPoint(liveLocalToWorld(lx, 0f, lz), screenW, screenH))
                         midPts.add(projectPoint(liveLocalToWorld(lx, ringH * 0.5f, lz), screenW, screenH))
@@ -2182,7 +2195,7 @@ class MainActivity : AppCompatActivity() {
                     val tPts = mutableListOf<PointF?>()
 
                     webXrDiskPaint.color = Color.argb(35, 88, 166, 255)
-                    webXrRingPaint.color = Color.parseColor("#58A6FF")
+                    webXrRingPaint.color = if (snapIsSnapping) Color.parseColor("#E3B341") else Color.parseColor("#58A6FF")
 
                     for (i in 0 until 32) {
                         val ang = (2.0 * Math.PI * i / 32).toFloat()
