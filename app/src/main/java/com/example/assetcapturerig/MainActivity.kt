@@ -86,7 +86,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (60 FPS ARCore + Pause Auto-Snap MagicTouch)\n")
+    private val debugLog = StringBuilder("App Initialized (60 FPS Auto-Snap + Post-Lock 3D XZ MagicTouch)\n")
     private var toneGen: ToneGenerator? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -373,7 +373,7 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("Auto-Snap MagicTouch Diagnostics")
+                .setTitle("Auto-Snap + Lock MagicTouch Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
@@ -420,7 +420,7 @@ class MainActivity : AppCompatActivity() {
                     mtFloatOutput = FloatArray(outElems)
                 }
 
-                // Pre-compute center (0.5, 0.5) Gaussian prompt map once to eliminate 262k exp() calls per snap
+                // Pre-compute center (0.5, 0.5) Gaussian prompt map once to avoid 262k exp() calls per snap
                 val gMap = FloatArray(mtInW * mtInH)
                 val cx = mtInW * 0.5f
                 val cy = mtInH * 0.5f
@@ -798,6 +798,22 @@ class MainActivity : AppCompatActivity() {
         dwellProgress = 0f
     }
 
+    private fun projectWorldToScreen(
+        wx: Float, wy: Float, wz: Float,
+        vpMat: FloatArray,
+        screenW: Float, screenH: Float
+    ): PointF? {
+        val clip = FloatArray(4)
+        Matrix.multiplyMV(clip, 0, vpMat, 0, floatArrayOf(wx, wy, wz, 1.0f), 0)
+        val w = clip[3]
+        if (w <= 0.01f) return null
+        val ndcX = clip[0] / w
+        val ndcY = clip[1] / w
+        val sx = (ndcX * 0.5f + 0.5f) * screenW
+        val sy = (-ndcY * 0.5f + 0.5f) * screenH
+        return PointF(sx, sy)
+    }
+
     // =========================================================================
     // PHASE 1: PAUSE-TRIGGERED AUTO-SNAP MAGICTOUCH (WORLD-PINNED AT 60 FPS)
     // =========================================================================
@@ -806,9 +822,7 @@ class MainActivity : AppCompatActivity() {
         val worldZ: Float,
         val widthM: Float,
         val depthM: Float,
-        val headingRad: Float,
-        val screenCX: Float,
-        val screenCY: Float
+        val headingRad: Float
     )
 
     private fun triggerAutoSnapMagicTouch(frame: Frame, tablePose: Pose) {
@@ -841,7 +855,6 @@ class MainActivity : AppCompatActivity() {
             frame, tableY, sW * 0.5f, sH * 0.5f, aimWorldX, aimWorldZ, 0.14f
         )
 
-        // Downscale PixelCopy directly to 512 on the short axis (avoids full-res copy + rescale)
         val targetW: Int
         val targetH: Int
         if (sW <= sH) {
@@ -922,7 +935,6 @@ class MainActivity : AppCompatActivity() {
                                     (min(fit.widthM, fit.depthM) * 0.45f).coerceIn(0.03f, 0.14f)
                                 }
 
-                                // Pin the snapped object to a real ARCore table-plane Anchor (60 FPS 0-lag tracking!)
                                 val newPin = createStabilizedTableAnchor(fit.worldX, tableY, fit.worldZ)
                                 try { preLockAnchor?.detach() } catch (_: Exception) {}
                                 preLockAnchor = newPin
@@ -947,13 +959,13 @@ class MainActivity : AppCompatActivity() {
                                 hasFailedSpot = false
                                 dwellProgress = 1f
 
-                                logDebug("✓ Auto-Snapped (${lastSnapLatencyMs}ms): ${(liveWidth * 100).roundToInt()}×${(liveDepth * 100).roundToInt()}×${(liveHeight * 100).roundToInt()}cm")
+                                val yawDeg = Math.toDegrees(liveAzimuth.toDouble()).roundToInt()
+                                logDebug("✓ Auto-Snapped (${lastSnapLatencyMs}ms): ${(liveWidth * 100).roundToInt()}×${(liveDepth * 100).roundToInt()}×${(liveHeight * 100).roundToInt()}cm | Yaw:${yawDeg}°")
                                 try {
                                     toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP2, 60)
                                 } catch (_: Exception) {}
                                 requestOverlayRedraw()
                             } else {
-                                // Empty table spot -> record cooldown so we don't re-fire until user moves aim
                                 hasFailedSpot = true
                                 failedSpotX = aimWorldX
                                 failedSpotZ = aimWorldZ
@@ -976,7 +988,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // PHASE 2: ZERO-JUMP LOCK HANDOFF (OR FALLBACK ONE-SHOT MAGICTOUCH)
+    // PHASE 2: LOCK + ALWAYS-ON POST-LOCK MAGICTOUCH ORIENTATION & FIT PASS
     // =========================================================================
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
@@ -987,12 +999,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val sW = sceneView.width.toFloat()
+        val sH = sceneView.height.toFloat()
         val tableY = tablePlane.centerPose.ty()
         val usedAutoSnap = hasLiveCling
         val anchor: Anchor?
 
         if (usedAutoSnap) {
-            // Promote the already-pinned MagicTouch anchor directly (0ms instant WYSIWYG lock!)
             val existingPin = preLockAnchor
             if (existingPin != null && existingPin.trackingState == TrackingState.TRACKING) {
                 anchor = existingPin
@@ -1041,24 +1054,40 @@ class MainActivity : AppCompatActivity() {
         val camPose = frame.camera.pose
         overlayView.updateLockedSnapshot(vpMat, snapshotAnchorPose, camPose)
 
-        if (usedAutoSnap) {
-            val wCm = (prismWidth * 100).roundToInt()
-            val dCm = (prismDepth * 100).roundToInt()
-            val hCm = (prismHeight * 100).roundToInt()
-            logDebug("✓ Instant WYSIWYG Lock: ${wCm}×${dCm}×${hCm}cm")
-            Toast.makeText(this, "✓ Locked: ${wCm}×${dCm}×${hCm}cm", Toast.LENGTH_SHORT).show()
+        // Project the pinned 3D reticle center into the lock frame so MagicTouch inspects the exact asset
+        val projectedCenter = if (usedAutoSnap) {
+            projectWorldToScreen(
+                snapshotAnchorPose.tx(),
+                tableY + prismHeight * 0.5f,
+                snapshotAnchorPose.tz(),
+                vpMat, sW, sH
+            )
         } else {
-            // User tapped Lock before auto-snap fired -> run one-shot MagicTouch immediately
-            val lockHeightM = measureObjectHeightSync(
-                frame, tableY, sceneView.width * 0.5f, sceneView.height * 0.5f,
-                snapshotAnchorPose.tx(), snapshotAnchorPose.tz(), 0.14f
-            )
-            if (lockHeightM > 0.015f) prismHeight = lockHeightM
-
-            runFallbackLockMagicTouch(
-                invVpMat, tableY, camPose.tx(), camPose.tz(), prismHeight
-            )
+            null
         }
+        val promptScreenX = projectedCenter?.x ?: (sW * 0.5f)
+        val promptScreenY = projectedCenter?.y ?: (sH * 0.5f)
+
+        // Re-measure physical height at the lock camera pose
+        val lockHeightM = measureObjectHeightSync(
+            frame, tableY, promptScreenX, promptScreenY,
+            snapshotAnchorPose.tx(), snapshotAnchorPose.tz(),
+            max(prismWidth, prismDepth) * 0.7f
+        )
+        if (lockHeightM > 0.015f) {
+            prismHeight = lockHeightM
+        }
+
+        // Always run a fresh post-lock MagicTouch inspection pass to correct orientation & fit
+        runPostLockMagicTouchRefine(
+            invVpMatrix = invVpMat,
+            tableY = tableY,
+            camX = camPose.tx(),
+            camZ = camPose.tz(),
+            promptScreenX = promptScreenX,
+            promptScreenY = promptScreenY,
+            seedHeightM = prismHeight
+        )
 
         actionButton.visibility = View.GONE
         scaleBar.visibility = View.VISIBLE
@@ -1075,11 +1104,13 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {}
     }
 
-    private fun runFallbackLockMagicTouch(
+    private fun runPostLockMagicTouchRefine(
         invVpMatrix: FloatArray,
         tableY: Float,
         camX: Float,
         camZ: Float,
+        promptScreenX: Float,
+        promptScreenY: Float,
         seedHeightM: Float
     ) {
         val sWidth = sceneView.width
@@ -1103,11 +1134,15 @@ class MainActivity : AppCompatActivity() {
                             val cropY = (bitmap.height - minDim) / 2f
                             squareBmp = Bitmap.createBitmap(bitmap, cropX.toInt(), cropY.toInt(), minDim, minDim)
 
-                            val fit = runMagicTouchSolveOnWorker(
+                            val normPromptX = ((promptScreenX - cropX) / minDim).coerceIn(0.15f, 0.85f)
+                            val normPromptY = ((promptScreenY - cropY) / minDim).coerceIn(0.15f, 0.85f)
+
+                            // Pass 1: Inspect the exact object inside the locked reticle
+                            var fit = runMagicTouchSolveOnWorker(
                                 interp = interp,
                                 squareBmp = squareBmp,
-                                normKeyX = 0.5f,
-                                normKeyY = 0.5f,
+                                normKeyX = normPromptX,
+                                normKeyY = normPromptY,
                                 cropXFull = cropX,
                                 cropYFull = cropY,
                                 minDimFull = minDim.toFloat(),
@@ -1119,6 +1154,26 @@ class MainActivity : AppCompatActivity() {
                                 camX = camX,
                                 camZ = camZ
                             )
+
+                            // Pass 2 (Fallback): Retry at exact screen center if projected prompt missed
+                            if (fit == null && (abs(normPromptX - 0.5f) > 0.02f || abs(normPromptY - 0.5f) > 0.02f)) {
+                                fit = runMagicTouchSolveOnWorker(
+                                    interp = interp,
+                                    squareBmp = squareBmp,
+                                    normKeyX = 0.5f,
+                                    normKeyY = 0.5f,
+                                    cropXFull = cropX,
+                                    cropYFull = cropY,
+                                    minDimFull = minDim.toFloat(),
+                                    sWidth = sWidth.toFloat(),
+                                    sHeight = sHeight.toFloat(),
+                                    invVpMatrix = invVpMatrix,
+                                    tableY = tableY,
+                                    estHeightM = seedHeightM,
+                                    camX = camX,
+                                    camZ = camZ
+                                )
+                            }
 
                             val elapsed = System.currentTimeMillis() - t0
                             if (fit != null) {
@@ -1144,16 +1199,19 @@ class MainActivity : AppCompatActivity() {
                                     val wCm = (prismWidth * 100).roundToInt()
                                     val dCm = (prismDepth * 100).roundToInt()
                                     val hCm = (prismHeight * 100).roundToInt()
-                                    logDebug("✓ MagicTouch Lock (${elapsed}ms): ${wCm}×${dCm}×${hCm}cm")
+                                    val yawDeg = Math.toDegrees(lockedFit.headingRad.toDouble()).roundToInt()
+                                    logDebug("✓ Post-Lock MagicTouch Refined (${elapsed}ms): ${wCm}×${dCm}×${hCm}cm | Yaw:${yawDeg}°")
                                     Toast.makeText(
                                         this@MainActivity,
-                                        "✓ MagicTouch Locked: ${wCm}×${dCm}×${hCm}cm",
+                                        "✓ MagicTouch Aligned: ${wCm}×${dCm}×${hCm}cm",
                                         Toast.LENGTH_SHORT
                                     ).show()
                                 }
+                            } else {
+                                logDebug("ℹ️ Post-Lock MagicTouch kept reticle fit (${elapsed}ms)")
                             }
                         } catch (e: Exception) {
-                            logDebug("❌ MagicTouch Lock Err: ${e.javaClass.simpleName}: ${e.message}")
+                            logDebug("❌ Post-Lock MagicTouch Err: ${e.javaClass.simpleName}: ${e.message}")
                         } finally {
                             try { squareBmp?.recycle() } catch (_: Exception) {}
                             try { bitmap.recycle() } catch (_: Exception) {}
@@ -1165,6 +1223,12 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    /**
+     * Runs magic_touch.tflite, extracts the prompted object's outer boundary cells,
+     * unprojects those contour points directly onto the horizontal 3D table mid-plane (XZ),
+     * and solves a 1° Rotating-Calipers minimum-area bounding box in true metric 3D XZ space
+     * so perspective tilt never skews the box orientation.
+     */
     private fun runMagicTouchSolveOnWorker(
         interp: Interpreter,
         squareBmp: Bitmap,
@@ -1350,9 +1414,7 @@ class MainActivity : AppCompatActivity() {
         queue.add(startIdx)
         visited[startIdx] = true
 
-        val fgScreenX = mutableListOf<Float>()
-        val fgScreenY = mutableListOf<Float>()
-        var sumX = 0f; var sumY = 0f
+        val compCells = mutableListOf<Int>()
         var touchesLeft = false; var touchesRight = false
         var touchesTop = false; var touchesBottom = false
 
@@ -1366,10 +1428,7 @@ class MainActivity : AppCompatActivity() {
             if (cy <= 2) touchesTop = true
             if (cy >= gSize - 3) touchesBottom = true
 
-            val sx = cropXFull + ((cx + 0.5f) / gSize) * minDimFull
-            val sy = cropYFull + ((cy + 0.5f) / gSize) * minDimFull
-            fgScreenX.add(sx); fgScreenY.add(sy)
-            sumX += sx; sumY += sy
+            compCells.add(curr)
 
             for (ny in (cy - 1)..(cy + 1)) {
                 for (nx in (cx - 1)..(cx + 1)) {
@@ -1384,82 +1443,97 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val count = fgScreenX.size
+        val compCount = compCells.size
         val edgeCount = (if (touchesLeft) 1 else 0) + (if (touchesRight) 1 else 0) +
             (if (touchesTop) 1 else 0) + (if (touchesBottom) 1 else 0)
-        if (count < 25 || count > (gSize * gSize * 0.65f).toInt() || edgeCount >= 3) {
+        if (compCount < 25 || compCount > (gSize * gSize * 0.65f).toInt() || edgeCount >= 3) {
             return null
         }
 
-        val barX = sumX / count
-        val barY = sumY / count
+        // Unproject outer contour cells directly onto the horizontal 3D table mid-plane (XZ)
+        val midPlaneY = tableY + estHeightM * 0.5f
+        val wxList = mutableListOf<Float>()
+        val wzList = mutableListOf<Float>()
+        var sumWX = 0f
+        var sumWZ = 0f
+        val useAllCells = compCount < 120
 
-        // Full 1° Rotating-Calipers minimum-area bounding box
+        for (cell in compCells) {
+            val cx = cell % gSize
+            val cy = cell / gSize
+            if (!useAllCells) {
+                val isInterior = visited[cell - 1] && visited[cell + 1] &&
+                    visited[cell - gSize] && visited[cell + gSize]
+                if (isInterior) continue
+            }
+            val sx = cropXFull + ((cx + 0.5f) / gSize) * minDimFull
+            val sy = cropYFull + ((cy + 0.5f) / gSize) * minDimFull
+            val pt3d = intersectScreenRayWithHorizontalPlane(sx, sy, sWidth, sHeight, invVpMatrix, midPlaneY) ?: continue
+            wxList.add(pt3d[0])
+            wzList.add(pt3d[2])
+            sumWX += pt3d[0]
+            sumWZ += pt3d[2]
+        }
+
+        val bCount = wxList.size
+        if (bCount < 12) return null
+
+        val barWX = sumWX / bCount
+        val barWZ = sumWZ / bCount
+
+        // True 3D World-Plane (XZ) 1° Rotating-Calipers minimum-area rectangle (zero perspective skew!)
         var bestArea = Float.MAX_VALUE
         var bestRad = 0f
         for (deg in 0 until 90) {
             val rad = Math.toRadians(deg.toDouble()).toFloat()
             val c = cos(rad); val s = sin(rad)
-            var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
-            var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
+            var min1 = Float.MAX_VALUE; var max1 = -Float.MAX_VALUE
+            var min2 = Float.MAX_VALUE; var max2 = -Float.MAX_VALUE
 
-            for (i in 0 until count) {
-                val dx = fgScreenX[i] - barX
-                val dy = fgScreenY[i] - barY
-                val pu = dx * c + dy * s
-                val pv = -dx * s + dy * c
-                if (pu < minU) minU = pu
-                if (pu > maxU) maxU = pu
-                if (pv < minV) minV = pv
-                if (pv > maxV) maxV = pv
+            for (i in 0 until bCount) {
+                val dx = wxList[i] - barWX
+                val dz = wzList[i] - barWZ
+                val p1 = dx * c + dz * s
+                val p2 = -dx * s + dz * c
+                if (p1 < min1) min1 = p1
+                if (p1 > max1) max1 = p1
+                if (p2 < min2) min2 = p2
+                if (p2 > max2) max2 = p2
             }
-            val area = (maxU - minU).coerceAtLeast(10f) * (maxV - minV).coerceAtLeast(10f)
-            if (area < bestArea) { bestArea = area; bestRad = rad }
+            val area = (max1 - min1).coerceAtLeast(0.015f) * (max2 - min2).coerceAtLeast(0.015f)
+            if (area < bestArea) {
+                bestArea = area
+                bestRad = rad
+            }
         }
 
-        val uX = cos(bestRad); val uY = sin(bestRad)
-        val vX = -uY; val vY = uX
+        // Strictly orthogonal unit axes in 3D world XZ space
+        val u1X = cos(bestRad); val u1Z = sin(bestRad)
+        val u2X = -u1Z; val u2Z = u1X
 
-        var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
-        var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
-        for (i in 0 until count) {
-            val dx = fgScreenX[i] - barX
-            val dy = fgScreenY[i] - barY
-            val pu = dx * uX + dy * uY
-            val pv = dx * vX + dy * vY
-            if (pu < minU) minU = pu
-            if (pu > maxU) maxU = pu
-            if (pv < minV) minV = pv
-            if (pv > maxV) maxV = pv
+        var min1 = Float.MAX_VALUE; var max1 = -Float.MAX_VALUE
+        var min2 = Float.MAX_VALUE; var max2 = -Float.MAX_VALUE
+        for (i in 0 until bCount) {
+            val dx = wxList[i] - barWX
+            val dz = wzList[i] - barWZ
+            val p1 = dx * u1X + dz * u1Z
+            val p2 = dx * u2X + dz * u2Z
+            if (p1 < min1) min1 = p1
+            if (p1 > max1) max1 = p1
+            if (p2 < min2) min2 = p2
+            if (p2 > max2) max2 = p2
         }
 
-        val midU = (minU + maxU) * 0.5f
-        val midV = (minV + maxV) * 0.5f
-        val halfSpan1Px = ((maxU - minU) * 0.5f).coerceAtLeast(14f)
-        val halfSpan2Px = ((maxV - minV) * 0.5f).coerceAtLeast(14f)
+        val span1 = (max1 - min1).coerceIn(0.035f, 0.45f)
+        val span2 = (max2 - min2).coerceIn(0.035f, 0.45f)
+        val mid1 = (min1 + max1) * 0.5f
+        val mid2 = (min2 + max2) * 0.5f
 
-        val centerScreenX = barX + midU * uX + midV * vX
-        val centerScreenY = barY + midU * uY + midV * vY
+        val centerWorldX = barWX + mid1 * u1X + mid2 * u2X
+        val centerWorldZ = barWZ + mid1 * u1Z + mid2 * u2Z
 
-        val midPlaneY = tableY + estHeightM * 0.5f
-
-        val pCenterMid = intersectScreenRayWithHorizontalPlane(centerScreenX, centerScreenY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p1AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan1Px * uX, centerScreenY + halfSpan1Px * uY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p1BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan1Px * uX, centerScreenY - halfSpan1Px * uY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p2AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan2Px * vX, centerScreenY + halfSpan2Px * vY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p2BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan2Px * vX, centerScreenY - halfSpan2Px * vY, sWidth, sHeight, invVpMatrix, midPlaneY)
-
-        if (pCenterMid == null || p1AMid == null || p1BMid == null || p2AMid == null || p2BMid == null) return null
-
-        val v1X = p1AMid[0] - p1BMid[0]; val v1Z = p1AMid[2] - p1BMid[2]
-        val span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceIn(0.035f, 0.45f)
-        val u1X = v1X / span1; val u1Z = v1Z / span1
-
-        val v2X = p2AMid[0] - p2BMid[0]; val v2Z = p2AMid[2] - p2BMid[2]
-        val span2 = sqrt(v2X * v2X + v2Z * v2Z).coerceIn(0.035f, 0.45f)
-        val u2X = v2X / span2; val u2Z = v2Z / span2
-
-        val camAngle = atan2(camX - pCenterMid[0], camZ - pCenterMid[2])
+        // Choose which of the 4 orthogonal faces points most directly toward the camera as FRONT (+Z)
+        val camAngle = atan2(camX - centerWorldX, camZ - centerWorldZ)
         val camDirX = sin(camAngle); val camDirZ = cos(camAngle)
 
         val dot0 = u1X * camDirX + u1Z * camDirZ
@@ -1480,20 +1554,34 @@ class MainActivity : AppCompatActivity() {
         val headingAngle: Float
 
         when (bestIdx) {
-            0 -> { finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(u1X, u1Z) }
-            1 -> { finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(-u1X, -u1Z) }
-            2 -> { finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(u2X, u2Z) }
-            else -> { finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(-u2X, -u2Z) }
+            0 -> {
+                finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(u1X, u1Z)
+            }
+            1 -> {
+                finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(-u1X, -u1Z)
+            }
+            2 -> {
+                finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(u2X, u2Z)
+            }
+            else -> {
+                finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(-u2X, -u2Z)
+            }
         }
 
         return MagicTouch3DFit(
-            worldX = pCenterMid[0],
-            worldZ = pCenterMid[2],
+            worldX = centerWorldX,
+            worldZ = centerWorldZ,
             widthM = finalWidth,
             depthM = finalDepth,
-            headingRad = headingAngle,
-            screenCX = centerScreenX,
-            screenCY = centerScreenY
+            headingRad = headingAngle
         )
     }
 
@@ -1539,7 +1627,7 @@ class MainActivity : AppCompatActivity() {
         val ray = unprojectScreenRay(screenX, screenY, screenWidth, screenHeight, invVpMatrix) ?: return null
         if (abs(ray[4]) < 1e-4f) return null
         val t = (planeY - ray[1]) / ray[4]
-        if (t <= 0.05f) return null
+        if (t <= 0.05f || t > 3.5f) return null
         return floatArrayOf(ray[0] + t * ray[3], planeY, ray[2] + t * ray[5])
     }
 
@@ -1574,7 +1662,6 @@ class MainActivity : AppCompatActivity() {
                 val aimZ = tablePose.tz()
 
                 if (hasLiveCling) {
-                    // World-pinned 60 FPS tracking via ARCore preLockAnchor (zero ML calls while orbiting!)
                     val pin = preLockAnchor
                     if (pin != null) {
                         if (pin.trackingState == TrackingState.TRACKING) {
@@ -1589,7 +1676,6 @@ class MainActivity : AppCompatActivity() {
                         liveWorldY = tableY
                     }
 
-                    // Instant release back to blue 60 FPS scanner if user pans crosshair away from pinned object
                     if (hasLiveCling) {
                         val panDist = sqrt((aimX - liveWorldX).pow(2) + (aimZ - liveWorldZ).pow(2))
                         val releaseRadius = max(max(liveWidth, liveDepth) * 0.85f, 0.11f)
@@ -1598,7 +1684,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 } else if (!isAutoSnapRunning) {
-                    // 60 FPS Dwell Detector: fires MagicTouch once when aim settles on an object
                     val skipFailedSpot = hasFailedSpot &&
                         sqrt((aimX - failedSpotX).pow(2) + (aimZ - failedSpotZ).pow(2)) < 0.045f &&
                         (now - failedSpotTimeMs) < 1500L
@@ -1620,7 +1705,6 @@ class MainActivity : AppCompatActivity() {
                         val rotDot = liveCamFwdX * dwellFwdX + liveCamFwdY * dwellFwdY + liveCamFwdZ * dwellFwdZ
 
                         if (moveDist > 0.022f || rotDot < 0.9985f) {
-                            // Still sweeping -> keep resetting dwell smoothly at 60 FPS
                             dwellStartMs = now
                             dwellRefX = aimX
                             dwellRefZ = aimZ
@@ -2112,7 +2196,6 @@ class MainActivity : AppCompatActivity() {
                 canvas.drawCircle(cx, cy, 18f, centerGuidePaint)
                 canvas.drawCircle(cx, cy, 4.5f, centerDotPaint)
 
-                // Draw dwell / snapping progress arc around center aim dot
                 if (!hasLiveCling && (snapDwellProgress > 0.05f || snapIsSnapping)) {
                     dwellArcRect.set(cx - 22f, cy - 22f, cx + 22f, cy + 22f)
                     dwellArcPaint.color = if (snapIsSnapping) Color.parseColor("#E3B341") else Color.parseColor("#3FB950")
@@ -2121,7 +2204,6 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (hasLiveCling && snapHitPose != null) {
-                    // Squarer 0.58-exponent squircle at 0.62x clears all rectangular corners cleanly
                     val rx = (liveWidth * 0.62f).coerceIn(0.028f, 0.28f)
                     val rz = (liveDepth * 0.62f).coerceIn(0.028f, 0.28f)
                     val ringH = liveHeight.coerceIn(0.028f, 0.24f)
