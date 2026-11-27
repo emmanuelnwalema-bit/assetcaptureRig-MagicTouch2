@@ -25,6 +25,11 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.objects.DetectedObject
+import com.google.mlkit.vision.objects.ObjectDetection
+import com.google.mlkit.vision.objects.ObjectDetector
+import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import io.github.sceneview.ar.ARSceneView
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -86,18 +91,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (Live MagicTouch + 8-Ray Table Grounding)\n")
+    private val debugLog = StringBuilder("App Initialized (ML Kit Live Tracking + MagicTouch Lock)\n")
     private var toneGen: ToneGenerator? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // =========================================================
-    // SINGLE-THREADED NON-BLOCKING MAGICTOUCH ENGINE (CPU-XNNPACK)
+    // HYBRID PIPELINE: ML KIT STREAM_MODE (LIVE) -> MAGICTOUCH (LOCK)
     // =========================================================
+    private var objectDetector: ObjectDetector? = null
+    @Volatile private var isPreLockMlRunning = false
+    @Volatile private var lastPreLockLatencyMs = 0L
+    private var lastPreLockMlTriggerMs = 0L
+    private var lastTrackedObjectId: Int? = null
+    private var liveClingMissCount = 0
+
+    // Single-threaded worker for one-shot MagicTouch refinement on Lock
     private val mlExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     @Volatile private var magicTouchInterpreter: Interpreter? = null
     private val magicTouchAssetName = "magic_touch.tflite"
 
-    // Pre-allocated reusable buffers (accessed strictly on mlExecutor)
     private var mtInH = 512
     private var mtInW = 512
     private var mtInC = 4
@@ -109,14 +121,8 @@ class MainActivity : AppCompatActivity() {
     private var mtPixelBuf: IntArray? = null
     private var mtFloatInput: FloatArray? = null
     private var mtFloatOutput: FloatArray? = null
-    private var centerGaussMap: FloatArray? = null
 
-    @Volatile private var isPreLockMlRunning = false
-    @Volatile private var lastPreLockLatencyMs = 0L
-    private var lastPreLockMlTriggerMs = 0L
-    private var preLockCopyBmp: Bitmap? = null
-
-    // Live camera pose snapshot for mid-pan stale-frame rejection
+    // Live camera pose snapshot for stale-frame rejection
     @Volatile private var liveCamX = 0f
     @Volatile private var liveCamY = 0f
     @Volatile private var liveCamZ = 0f
@@ -152,7 +158,7 @@ class MainActivity : AppCompatActivity() {
     private var prismHeight = 0.05f
 
     // =========================================================
-    // 3D ENCAPSULATING RING LIVE CLING STATE (DRIVEN BY LIVE MAGICTOUCH)
+    // 3D ENCAPSULATING RING LIVE CLING STATE (DRIVEN BY ML KIT)
     // =========================================================
     @Volatile private var hasLiveCling = false
     @Volatile private var liveWorldX = 0f
@@ -162,8 +168,6 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var liveDepth = 0.10f
     @Volatile private var liveHeight = 0.045f
     @Volatile private var liveAzimuth = 0f
-    private var liveCos2A = 1f
-    private var liveSin2A = 0f
     @Volatile private var liveClingScreenX = 0f
     @Volatile private var liveClingScreenY = 0f
 
@@ -239,6 +243,7 @@ class MainActivity : AppCompatActivity() {
             toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
         } catch (e: Exception) {}
 
+        initMlKitObjectDetector()
         initMagicTouchModel()
 
         overlayView = PrismOverlayView(this)
@@ -313,6 +318,8 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         try {
             prismAnchor?.detach()
+            objectDetector?.close()
+            objectDetector = null
             mlExecutor.execute {
                 try { magicTouchInterpreter?.close() } catch (_: Exception) {}
                 magicTouchInterpreter = null
@@ -355,11 +362,26 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("Live MagicTouch Diagnostics")
+                .setTitle("ML Kit + MagicTouch Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
                 .show()
+        }
+    }
+
+    private fun initMlKitObjectDetector() {
+        try {
+            // STREAM_MODE + enableMultipleObjects (no classification) keeps detection fast,
+            // class-agnostic, and allows selecting the object closest to the center aim dot.
+            val options = ObjectDetectorOptions.Builder()
+                .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
+                .enableMultipleObjects()
+                .build()
+            objectDetector = ObjectDetection.getClient(options)
+            logDebug("✓ ML Kit ObjectDetector Ready [STREAM_MODE, Class-Agnostic]")
+        } catch (e: Exception) {
+            logDebug("❌ ML Kit Init Failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -401,22 +423,6 @@ class MainActivity : AppCompatActivity() {
                     for (d in mtOutShape) outElems *= d
                     mtFloatOutput = FloatArray(outElems)
                 }
-
-                // Pre-compute center (0.5, 0.5) Gaussian prompt heatmap once to skip 262k exp() calls per frame
-                val gMap = FloatArray(mtInW * mtInH)
-                val cx = mtInW * 0.5f
-                val cy = mtInH * 0.5f
-                val invTwoSigmaSq = 1.0f / (2.0f * 12.0f * 12.0f)
-                var idx = 0
-                for (y in 0 until mtInH) {
-                    val dy = y - cy
-                    val dySq = dy * dy
-                    for (x in 0 until mtInW) {
-                        val dx = x - cx
-                        gMap[idx++] = exp(-(dx * dx + dySq) * invTwoSigmaSq)
-                    }
-                }
-                centerGaussMap = gMap
 
                 magicTouchInterpreter = interp
                 logDebug("✓ MagicTouch Ready [CPU-XNNPACK]! In:${inShape.contentToString()} Out:${mtOutShape.contentToString()}")
@@ -561,7 +567,7 @@ class MainActivity : AppCompatActivity() {
             return Pair(rootPlane, pose)
         }
 
-        // Center ray struck elevated asset -> cast 8 perimeter rays on the table around it
+        // Center ray hit the elevated asset -> cast 8 perimeter rays on the table surrounding it
         val minDim = min(sW, sH)
         val ringR = minDim * 0.28f
         val planeVotes = mutableMapOf<Plane, Int>()
@@ -773,373 +779,54 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // SHARED MAGICTOUCH 3D SOLVER (DRIVES BOTH LIVE PRE-LOCK & FINAL LOCK)
+    // PHASE 1: REAL-TIME ML KIT OBJECT DETECTION & TRACKING (PRE-LOCK ~30 FPS)
     // =========================================================================
-    private data class MagicTouch3DFit(
-        val worldX: Float,
-        val worldZ: Float,
-        val widthM: Float,
-        val depthM: Float,
-        val headingRad: Float,
-        val screenCX: Float,
-        val screenCY: Float
-    )
+    private fun triggerPreLockMlKitDetector(frame: Frame, tablePose: Pose) {
+        val detector = objectDetector ?: return
+        val sW = sceneView.width.toFloat()
+        val sH = sceneView.height.toFloat()
+        if (sW <= 0f || sH <= 0f || isPreLockMlRunning) return
 
-    /**
-     * Executes magic_touch.tflite on mlExecutor using pre-allocated bulk buffers,
-     * extracts the prompted object component (rejecting full-table background masks),
-     * solves its Rotating-Calipers 2D fit, and unprojects onto the table plane.
-     */
-    private fun runMagicTouchSolveOnWorker(
-        interp: Interpreter,
-        squareBmp: Bitmap,
-        normKeyX: Float,
-        normKeyY: Float,
-        cropXFull: Float,
-        cropYFull: Float,
-        minDimFull: Float,
-        sWidth: Float,
-        sHeight: Float,
-        invVpMatrix: FloatArray,
-        tableY: Float,
-        estHeightM: Float,
-        camX: Float,
-        camZ: Float,
-        angleStepDeg: Int
-    ): MagicTouch3DFit? {
-        val scaled = if (squareBmp.width == mtInW && squareBmp.height == mtInH) {
-            squareBmp
+        val mediaImage: Image = try {
+            frame.acquireCameraImage()
+        } catch (_: Exception) {
+            return
+        }
+
+        val imgW = mediaImage.width
+        val imgH = mediaImage.height
+
+        // Synchronously snapshot the exact ARCore IMAGE_PIXELS -> VIEW affine transform
+        val imgBasis = floatArrayOf(0f, 0f, imgW.toFloat(), 0f, 0f, imgH.toFloat())
+        val viewBasis = FloatArray(6)
+        try {
+            frame.transformCoordinates2d(
+                Coordinates2d.IMAGE_PIXELS, imgBasis,
+                Coordinates2d.VIEW, viewBasis
+            )
+        } catch (_: Exception) {
+            mediaImage.close()
+            return
+        }
+
+        val ox = viewBasis[0]
+        val oy = viewBasis[1]
+        val uxX = (viewBasis[2] - ox) / imgW.toFloat()
+        val uxY = (viewBasis[3] - oy) / imgW.toFloat()
+        val uyX = (viewBasis[4] - ox) / imgH.toFloat()
+        val uyY = (viewBasis[5] - oy) / imgH.toFloat()
+
+        // Derive the exact upright rotation degrees for ML Kit directly from ARCore's sensor->screen basis
+        val rotationDegrees = if (abs(uxY) >= abs(uxX)) {
+            if (uxY > 0f) 90 else 270
         } else {
-            Bitmap.createScaledBitmap(squareBmp, mtInW, mtInH, true)
+            if (uxX > 0f) 0 else 180
         }
-
-        val pixCount = mtInW * mtInH
-        val pixels = mtPixelBuf ?: IntArray(pixCount).also { mtPixelBuf = it }
-        scaled.getPixels(pixels, 0, mtInW, 0, 0, mtInW, mtInH)
-        if (scaled !== squareBmp) scaled.recycle()
-
-        val inputBuf = mtInputBuf ?: return null
-        val outputBuf = mtOutputBuf ?: return null
-        inputBuf.clear()
-
-        val useCenterGauss = abs(normKeyX - 0.5f) < 0.002f && abs(normKeyY - 0.5f) < 0.002f && centerGaussMap != null
-        val keyPxX = normKeyX * mtInW
-        val keyPxY = normKeyY * mtInH
-        val invTwoSigmaSq = 1.0f / (2.0f * 12.0f * 12.0f)
-        val inv255 = 1.0f / 255.0f
-
-        if (mtInType == DataType.FLOAT32) {
-            val fIn = mtFloatInput ?: FloatArray(pixCount * mtInC).also { mtFloatInput = it }
-            var outIdx = 0
-            if (useCenterGauss) {
-                val gMap = centerGaussMap!!
-                if (mtInC >= 4) {
-                    for (i in 0 until pixCount) {
-                        val px = pixels[i]
-                        fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
-                        fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
-                        fIn[outIdx++] = (px and 0xFF) * inv255
-                        fIn[outIdx++] = gMap[i]
-                    }
-                } else {
-                    for (i in 0 until pixCount) {
-                        val px = pixels[i]
-                        fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
-                        fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
-                        fIn[outIdx++] = (px and 0xFF) * inv255
-                    }
-                }
-            } else {
-                var pIdx = 0
-                for (y in 0 until mtInH) {
-                    val dy = y - keyPxY
-                    val dySq = dy * dy
-                    for (x in 0 until mtInW) {
-                        val px = pixels[pIdx++]
-                        fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
-                        fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
-                        fIn[outIdx++] = (px and 0xFF) * inv255
-                        if (mtInC >= 4) {
-                            val dx = x - keyPxX
-                            fIn[outIdx++] = exp(-(dx * dx + dySq) * invTwoSigmaSq)
-                        }
-                    }
-                }
-            }
-            inputBuf.asFloatBuffer().put(fIn)
-        } else {
-            var pIdx = 0
-            val gMap = if (useCenterGauss) centerGaussMap else null
-            for (y in 0 until mtInH) {
-                val dy = y - keyPxY
-                val dySq = dy * dy
-                for (x in 0 until mtInW) {
-                    val px = pixels[pIdx]
-                    inputBuf.put(((px shr 16) and 0xFF).toByte())
-                    inputBuf.put(((px shr 8) and 0xFF).toByte())
-                    inputBuf.put((px and 0xFF).toByte())
-                    if (mtInC >= 4) {
-                        val g = gMap?.get(pIdx) ?: exp(-((x - keyPxX) * (x - keyPxX) + dySq) * invTwoSigmaSq)
-                        inputBuf.put((g * 255f).toInt().coerceIn(0, 255).toByte())
-                    }
-                    pIdx++
-                }
-            }
-        }
-        inputBuf.rewind()
-        outputBuf.clear()
-
-        interp.run(inputBuf, outputBuf)
-        outputBuf.rewind()
-
-        val mH: Int; val mW: Int; val mC: Int
-        when (mtOutShape.size) {
-            4 -> if (mtOutShape[3] <= 4) { mH = mtOutShape[1]; mW = mtOutShape[2]; mC = mtOutShape[3] } else { mC = mtOutShape[1]; mH = mtOutShape[2]; mW = mtOutShape[3] }
-            3 -> { mH = mtOutShape[1]; mW = mtOutShape[2]; mC = 1 }
-            else -> return null
-        }
-
-        val floatOut = if (mtOutType == DataType.FLOAT32) {
-            val arr = mtFloatOutput ?: FloatArray(mW * mH * mC).also { mtFloatOutput = it }
-            outputBuf.asFloatBuffer().get(arr)
-            arr
-        } else {
-            null
-        }
-
-        fun scoreAt(mx: Int, my: Int): Float {
-            val i = my * mW + mx
-            return if (floatOut != null) {
-                if (mC == 1) floatOut[i] else (floatOut[i * mC + (mC - 1)] - floatOut[i * mC])
-            } else {
-                (outputBuf.get(i * mC + (mC - 1)).toInt() and 0xFF) * inv255
-            }
-        }
-
-        val seedX = (normKeyX * mW).toInt().coerceIn(8, mW - 9)
-        val seedY = (normKeyY * mH).toInt().coerceIn(8, mH - 9)
-        var seedSum = 0f; var seedCnt = 0
-        for (dy in -4..4) {
-            for (dx in -4..4) {
-                seedSum += scoreAt(seedX + dx, seedY + dy)
-                seedCnt++
-            }
-        }
-        val seedMean = seedSum / seedCnt
-
-        var borderSum = 0f; var borderCnt = 0
-        for (x in 0 until mW step 4) {
-            borderSum += scoreAt(x, 2) + scoreAt(x, mH - 3)
-            borderCnt += 2
-        }
-        for (y in 0 until mH step 4) {
-            borderSum += scoreAt(2, y) + scoreAt(mW - 3, y)
-            borderCnt += 2
-        }
-        val borderMean = borderSum / borderCnt.coerceAtLeast(1)
-
-        if (abs(seedMean - borderMean) < 0.04f) return null
-
-        val thresh = borderMean + (seedMean - borderMean) * 0.48f
-        val seedIsHigher = seedMean > borderMean
-
-        val gSize = 112
-        val gridMask = BooleanArray(gSize * gSize)
-        for (gy in 1 until gSize - 1) {
-            val my = (gy * mH) / gSize
-            for (gx in 1 until gSize - 1) {
-                val mx = (gx * mW) / gSize
-                val s = scoreAt(mx, my)
-                gridMask[gy * gSize + gx] = if (seedIsHigher) (s >= thresh) else (s <= thresh)
-            }
-        }
-
-        val seedGX = (normKeyX * gSize).toInt().coerceIn(4, gSize - 5)
-        val seedGY = (normKeyY * gSize).toInt().coerceIn(4, gSize - 5)
-        var startIdx = -1
-        var bestDist = Int.MAX_VALUE
-        for (gy in (seedGY - 8)..(seedGY + 8)) {
-            for (gx in (seedGX - 8)..(seedGX + 8)) {
-                if (gx in 1 until (gSize - 1) && gy in 1 until (gSize - 1)) {
-                    val idx = gy * gSize + gx
-                    if (gridMask[idx]) {
-                        val d = (gx - seedGX) * (gx - seedGX) + (gy - seedGY) * (gy - seedGY)
-                        if (d < bestDist) { bestDist = d; startIdx = idx }
-                    }
-                }
-            }
-        }
-        if (startIdx == -1) return null
-
-        val visited = BooleanArray(gSize * gSize)
-        val queue = ArrayDeque<Int>()
-        queue.add(startIdx)
-        visited[startIdx] = true
-
-        val fgScreenX = mutableListOf<Float>()
-        val fgScreenY = mutableListOf<Float>()
-        var sumX = 0f; var sumY = 0f
-        var touchesLeft = false; var touchesRight = false
-        var touchesTop = false; var touchesBottom = false
-
-        while (!queue.isEmpty()) {
-            val curr = queue.removeFirst()
-            val cx = curr % gSize
-            val cy = curr / gSize
-
-            if (cx <= 2) touchesLeft = true
-            if (cx >= gSize - 3) touchesRight = true
-            if (cy <= 2) touchesTop = true
-            if (cy >= gSize - 3) touchesBottom = true
-
-            val sx = cropXFull + ((cx + 0.5f) / gSize) * minDimFull
-            val sy = cropYFull + ((cy + 0.5f) / gSize) * minDimFull
-            fgScreenX.add(sx); fgScreenY.add(sy)
-            sumX += sx; sumY += sy
-
-            for (ny in (cy - 1)..(cy + 1)) {
-                for (nx in (cx - 1)..(cx + 1)) {
-                    if (nx in 1 until (gSize - 1) && ny in 1 until (gSize - 1)) {
-                        val nIdx = ny * gSize + nx
-                        if (gridMask[nIdx] && !visited[nIdx]) {
-                            visited[nIdx] = true
-                            queue.add(nIdx)
-                        }
-                    }
-                }
-            }
-        }
-
-        val count = fgScreenX.size
-        val edgeCount = (if (touchesLeft) 1 else 0) + (if (touchesRight) 1 else 0) +
-            (if (touchesTop) 1 else 0) + (if (touchesBottom) 1 else 0)
-
-        // Reject tiny noise specks or full-table background floods
-        if (count < 24 || count > (gSize * gSize * 0.65f).toInt() || edgeCount >= 3) {
-            return null
-        }
-
-        val barX = sumX / count
-        val barY = sumY / count
-
-        var bestArea = Float.MAX_VALUE
-        var bestRad = 0f
-        for (deg in 0 until 90 step angleStepDeg) {
-            val rad = Math.toRadians(deg.toDouble()).toFloat()
-            val c = cos(rad); val s = sin(rad)
-            var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
-            var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
-
-            for (i in 0 until count) {
-                val dx = fgScreenX[i] - barX
-                val dy = fgScreenY[i] - barY
-                val pu = dx * c + dy * s
-                val pv = -dx * s + dy * c
-                if (pu < minU) minU = pu
-                if (pu > maxU) maxU = pu
-                if (pv < minV) minV = pv
-                if (pv > maxV) maxV = pv
-            }
-            val area = (maxU - minU).coerceAtLeast(10f) * (maxV - minV).coerceAtLeast(10f)
-            if (area < bestArea) { bestArea = area; bestRad = rad }
-        }
-
-        val uX = cos(bestRad); val uY = sin(bestRad)
-        val vX = -uY; val vY = uX
-
-        var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
-        var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
-        for (i in 0 until count) {
-            val dx = fgScreenX[i] - barX
-            val dy = fgScreenY[i] - barY
-            val pu = dx * uX + dy * uY
-            val pv = dx * vX + dy * vY
-            if (pu < minU) minU = pu
-            if (pu > maxU) maxU = pu
-            if (pv < minV) minV = pv
-            if (pv > maxV) maxV = pv
-        }
-
-        val midU = (minU + maxU) * 0.5f
-        val midV = (minV + maxV) * 0.5f
-        val halfSpan1Px = ((maxU - minU) * 0.5f).coerceAtLeast(14f)
-        val halfSpan2Px = ((maxV - minV) * 0.5f).coerceAtLeast(14f)
-
-        val centerScreenX = barX + midU * uX + midV * vX
-        val centerScreenY = barY + midU * uY + midV * vY
-
-        val midPlaneY = tableY + estHeightM * 0.5f
-
-        val pCenterMid = intersectScreenRayWithHorizontalPlane(centerScreenX, centerScreenY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p1AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan1Px * uX, centerScreenY + halfSpan1Px * uY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p1BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan1Px * uX, centerScreenY - halfSpan1Px * uY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p2AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan2Px * vX, centerScreenY + halfSpan2Px * vY, sWidth, sHeight, invVpMatrix, midPlaneY)
-        val p2BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan2Px * vX, centerScreenY - halfSpan2Px * vY, sWidth, sHeight, invVpMatrix, midPlaneY)
-
-        if (pCenterMid == null || p1AMid == null || p1BMid == null || p2AMid == null || p2BMid == null) return null
-
-        val v1X = p1AMid[0] - p1BMid[0]; val v1Z = p1AMid[2] - p1BMid[2]
-        val span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceIn(0.035f, 0.45f)
-        val u1X = v1X / span1; val u1Z = v1Z / span1
-
-        val v2X = p2AMid[0] - p2BMid[0]; val v2Z = p2AMid[2] - p2BMid[2]
-        val span2 = sqrt(v2X * v2X + v2Z * v2Z).coerceIn(0.035f, 0.45f)
-        val u2X = v2X / span2; val u2Z = v2Z / span2
-
-        val camAngle = atan2(camX - pCenterMid[0], camZ - pCenterMid[2])
-        val camDirX = sin(camAngle); val camDirZ = cos(camAngle)
-
-        val dot0 = u1X * camDirX + u1Z * camDirZ
-        val dot1 = -dot0
-        val dot2 = u2X * camDirX + u2Z * camDirZ
-        val dot3 = -dot2
-
-        val dots = floatArrayOf(dot0, dot1, dot2, dot3)
-        var bestIdx = 0
-        var maxDot = -Float.MAX_VALUE
-        for (i in 0 until 4) {
-            if (dots[i] > maxDot) { maxDot = dots[i]; bestIdx = i }
-        }
-
-        val margin = 1.05f
-        val finalWidth: Float
-        val finalDepth: Float
-        val headingAngle: Float
-
-        when (bestIdx) {
-            0 -> { finalDepth = (span1 * margin + 0.005f).coerceIn(0.04f, 0.45f); finalWidth = (span2 * margin + 0.005f).coerceIn(0.04f, 0.45f); headingAngle = atan2(u1X, u1Z) }
-            1 -> { finalDepth = (span1 * margin + 0.005f).coerceIn(0.04f, 0.45f); finalWidth = (span2 * margin + 0.005f).coerceIn(0.04f, 0.45f); headingAngle = atan2(-u1X, -u1Z) }
-            2 -> { finalDepth = (span2 * margin + 0.005f).coerceIn(0.04f, 0.45f); finalWidth = (span1 * margin + 0.005f).coerceIn(0.04f, 0.45f); headingAngle = atan2(u2X, u2Z) }
-            else -> { finalDepth = (span2 * margin + 0.005f).coerceIn(0.04f, 0.45f); finalWidth = (span1 * margin + 0.005f).coerceIn(0.04f, 0.45f); headingAngle = atan2(-u2X, -u2Z) }
-        }
-
-        return MagicTouch3DFit(
-            worldX = pCenterMid[0],
-            worldZ = pCenterMid[2],
-            widthM = finalWidth,
-            depthM = finalDepth,
-            headingRad = headingAngle,
-            screenCX = centerScreenX,
-            screenCY = centerScreenY
-        )
-    }
-
-    // =========================================================================
-    // PHASE 1: LIVE PRE-LOCK MAGICTOUCH RETICLE (NON-BLOCKING)
-    // =========================================================================
-    private fun triggerPreLockMagicTouch(frame: Frame, tablePose: Pose) {
-        val sW = sceneView.width
-        val sH = sceneView.height
-        if (sW <= 0 || sH <= 0 || isPreLockMlRunning) return
-        if (magicTouchInterpreter == null) return
-
-        isPreLockMlRunning = true
-        lastPreLockMlTriggerMs = System.currentTimeMillis()
 
         val snapVp = frameVpMatrix.copyOf()
         val snapInvVp = FloatArray(16)
         if (!Matrix.invertM(snapInvVp, 0, snapVp, 0)) {
-            isPreLockMlRunning = false
+            mediaImage.close()
             return
         }
 
@@ -1160,143 +847,213 @@ class MainActivity : AppCompatActivity() {
             frame, tableY, probeScreenX, probeScreenY, probeWorldX, probeWorldZ, max(liveWidth, liveDepth) * 0.65f
         )
 
-        // Downscale PixelCopy directly to 512 on the short axis (zero extra createScaledBitmap!)
-        val targetW: Int
-        val targetH: Int
-        if (sW <= sH) {
-            targetW = mtInW
-            targetH = max(mtInH, (mtInW.toFloat() * sH / sW).roundToInt())
+        val inputImage = try {
+            InputImage.fromMediaImage(mediaImage, rotationDegrees)
+        } catch (e: Exception) {
+            mediaImage.close()
+            return
+        }
+
+        isPreLockMlRunning = true
+        lastPreLockMlTriggerMs = System.currentTimeMillis()
+        val startMs = lastPreLockMlTriggerMs
+
+        detector.process(inputImage)
+            .addOnSuccessListener { detectedObjects ->
+                lastPreLockLatencyMs = System.currentTimeMillis() - startMs
+                if (isBoxPlaced) return@addOnSuccessListener
+
+                // Drop stale detection only on very fast camera whips (> 18° turn or > 10cm shift)
+                val rotDot = snapFwdX * liveCamFwdX + snapFwdY * liveCamFwdY + snapFwdZ * liveCamFwdZ
+                val camShift = sqrt(
+                    (liveCamX - snapCamX).pow(2) +
+                        (liveCamY - snapCamY).pow(2) +
+                        (liveCamZ - snapCamZ).pow(2)
+                )
+                if (rotDot < 0.951f || camShift > 0.10f) return@addOnSuccessListener
+
+                processMlKitDetections(
+                    detectedObjects = detectedObjects,
+                    imgW = imgW,
+                    imgH = imgH,
+                    rotationDegrees = rotationDegrees,
+                    ox = ox, oy = oy,
+                    uxX = uxX, uxY = uxY,
+                    uyX = uyX, uyY = uyY,
+                    sWidth = sW,
+                    sHeight = sH,
+                    invVpMatrix = snapInvVp,
+                    tableY = tableY,
+                    camX = snapCamX,
+                    camZ = snapCamZ,
+                    measuredHeightM = measuredHeightM
+                )
+            }
+            .addOnFailureListener { e ->
+                logDebug("⚠️ ML Kit Err: ${e.message}")
+            }
+            .addOnCompleteListener {
+                try { mediaImage.close() } catch (_: Exception) {}
+                isPreLockMlRunning = false
+            }
+    }
+
+    private fun processMlKitDetections(
+        detectedObjects: List<DetectedObject>,
+        imgW: Int,
+        imgH: Int,
+        rotationDegrees: Int,
+        ox: Float, oy: Float,
+        uxX: Float, uxY: Float,
+        uyX: Float, uyY: Float,
+        sWidth: Float,
+        sHeight: Float,
+        invVpMatrix: FloatArray,
+        tableY: Float,
+        camX: Float,
+        camZ: Float,
+        measuredHeightM: Float
+    ) {
+        fun mlKitPointToScreen(mx: Float, my: Float): Pair<Float, Float> {
+            val rx: Float
+            val ry: Float
+            when (rotationDegrees) {
+                90 -> { rx = my; ry = imgH - 1f - mx }
+                180 -> { rx = imgW - 1f - mx; ry = imgH - 1f - my }
+                270 -> { rx = imgW - 1f - my; ry = mx }
+                else -> { rx = mx; ry = my }
+            }
+            val sx = ox + rx * uxX + ry * uyX
+            val sy = oy + rx * uxY + ry * uyY
+            return Pair(sx, sy)
+        }
+
+        val aimX = sWidth * 0.5f
+        val aimY = sHeight * 0.5f
+        val minDim = min(sWidth, sHeight)
+        val screenArea = (sWidth * sHeight).coerceAtLeast(1f)
+
+        var bestObj: DetectedObject? = null
+        var bestRect: RectF? = null
+        var bestScore = -Float.MAX_VALUE
+
+        for (obj in detectedObjects) {
+            val b = obj.boundingBox
+            val (x1, y1) = mlKitPointToScreen(b.left.toFloat(), b.top.toFloat())
+            val (x2, y2) = mlKitPointToScreen(b.right.toFloat(), b.bottom.toFloat())
+            val rect = RectF(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+            val bw = rect.width()
+            val bh = rect.height()
+            val areaFrac = (bw * bh) / screenArea
+            if (bw < 32f || bh < 32f || areaFrac > 0.68f) continue
+            if (bw > sWidth * 0.90f && bh > sHeight * 0.82f) continue
+
+            val cx = rect.centerX()
+            val cy = rect.centerY()
+            val distNorm = sqrt((cx - aimX).pow(2) + (cy - aimY).pow(2)) / minDim
+            val containsAim = rect.contains(aimX, aimY)
+
+            // Require object to contain the aim dot or sit magnetically close to center
+            if (!containsAim && distNorm > 0.30f) continue
+
+            val trackBonus = if (obj.trackingId != null && obj.trackingId == lastTrackedObjectId) 0.18f else 0f
+            val containBonus = if (containsAim) 0.55f else 0f
+            val score = containBonus + trackBonus - distNorm * 1.8f - areaFrac * 0.25f
+
+            if (score > bestScore) {
+                bestScore = score
+                bestObj = obj
+                bestRect = rect
+            }
+        }
+
+        val chosen = bestObj
+        val rect = bestRect
+        if (chosen == null || rect == null) {
+            liveClingMissCount++
+            if (liveClingMissCount >= 2) {
+                hasLiveCling = false
+                lastTrackedObjectId = null
+            }
+            return
+        }
+
+        val boxCX = rect.centerX()
+        val boxCY = rect.centerY()
+        val estHeight = if (measuredHeightM > 0.015f) measuredHeightM else liveHeight
+        val estMidY = tableY + estHeight * 0.5f
+
+        val pCenter = intersectScreenRayWithHorizontalPlane(boxCX, boxCY, sWidth, sHeight, invVpMatrix, estMidY)
+        val pLeft = intersectScreenRayWithHorizontalPlane(rect.left, boxCY, sWidth, sHeight, invVpMatrix, estMidY)
+        val pRight = intersectScreenRayWithHorizontalPlane(rect.right, boxCY, sWidth, sHeight, invVpMatrix, estMidY)
+        val pTop = intersectScreenRayWithHorizontalPlane(boxCX, rect.top, sWidth, sHeight, invVpMatrix, estMidY)
+        val pBottom = intersectScreenRayWithHorizontalPlane(boxCX, rect.bottom, sWidth, sHeight, invVpMatrix, estMidY)
+
+        if (pCenter == null || pLeft == null || pRight == null || pTop == null || pBottom == null) {
+            liveClingMissCount++
+            if (liveClingMissCount >= 2) hasLiveCling = false
+            return
+        }
+
+        val spanW = sqrt((pRight[0] - pLeft[0]).pow(2) + (pRight[2] - pLeft[2]).pow(2)).coerceIn(0.04f, 0.45f)
+        val spanD = sqrt((pBottom[0] - pTop[0]).pow(2) + (pBottom[2] - pTop[2]).pow(2)).coerceIn(0.04f, 0.45f)
+        val camHeading = atan2(camX - pCenter[0], camZ - pCenter[2])
+
+        val targetW = (spanW * 1.04f).coerceIn(0.04f, 0.45f)
+        val targetD = (spanD * 1.04f).coerceIn(0.04f, 0.45f)
+        val targetH = if (measuredHeightM > 0.015f) {
+            measuredHeightM
         } else {
-            targetH = mtInH
-            targetW = max(mtInW, (mtInH.toFloat() * sW / sH).roundToInt())
+            (min(targetW, targetD) * 0.45f).coerceIn(0.03f, 0.14f)
         }
-        if (preLockCopyBmp == null || preLockCopyBmp!!.width != targetW || preLockCopyBmp!!.height != targetH) {
-            preLockCopyBmp = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+
+        liveClingMissCount = 0
+        val switchedObject = (chosen.trackingId != null && chosen.trackingId != lastTrackedObjectId)
+        lastTrackedObjectId = chosen.trackingId
+
+        val posJump = sqrt((pCenter[0] - liveWorldX).pow(2) + (pCenter[2] - liveWorldZ).pow(2))
+
+        if (!hasLiveCling || switchedObject || posJump > 0.06f) {
+            liveWorldX = pCenter[0]
+            liveWorldY = tableY
+            liveWorldZ = pCenter[2]
+            liveWidth = targetW
+            liveDepth = targetD
+            liveHeight = targetH
+            liveAzimuth = camHeading
+            liveClingScreenX = boxCX
+            liveClingScreenY = boxCY
+            hasLiveCling = true
+        } else {
+            // Fast 30 FPS tracking: responsive to movement while smoothing 1-2px detector jitter
+            val alphaPos = 0.55f
+            val alphaDim = 0.45f
+            liveWorldX += alphaPos * (pCenter[0] - liveWorldX)
+            liveWorldY = tableY
+            liveWorldZ += alphaPos * (pCenter[2] - liveWorldZ)
+            liveWidth += alphaDim * (targetW - liveWidth)
+            liveDepth += alphaDim * (targetD - liveDepth)
+            liveHeight += alphaDim * (targetH - liveHeight)
+            liveAzimuth = camHeading
+            liveClingScreenX += alphaPos * (boxCX - liveClingScreenX)
+            liveClingScreenY += alphaPos * (boxCY - liveClingScreenY)
         }
-        val destBmp = preLockCopyBmp!!
-
-        PixelCopy.request(
-            sceneView as SurfaceView,
-            destBmp,
-            PixelCopy.OnPixelCopyFinishedListener { copyResult ->
-                if (copyResult != PixelCopy.SUCCESS || isBoxPlaced) {
-                    isPreLockMlRunning = false
-                    return@OnPixelCopyFinishedListener
-                }
-
-                val bmpCopy = destBmp.copy(Bitmap.Config.ARGB_8888, false)
-                mlExecutor.execute {
-                    try {
-                        val interp = magicTouchInterpreter ?: return@execute
-                        if (isBoxPlaced) return@execute
-
-                        val t0 = System.currentTimeMillis()
-                        val minDimSmall = min(bmpCopy.width, bmpCopy.height)
-                        val cropXSmall = (bmpCopy.width - minDimSmall) / 2
-                        val cropYSmall = (bmpCopy.height - minDimSmall) / 2
-                        val squareSmall = Bitmap.createBitmap(bmpCopy, cropXSmall, cropYSmall, minDimSmall, minDimSmall)
-                        bmpCopy.recycle()
-
-                        val minDimFull = min(sW, sH).toFloat()
-                        val cropXFull = (sW - minDimFull) * 0.5f
-                        val cropYFull = (sH - minDimFull) * 0.5f
-                        val estHeight = if (measuredHeightM > 0.015f) measuredHeightM else liveHeight
-
-                        val fit = runMagicTouchSolveOnWorker(
-                            interp = interp,
-                            squareBmp = squareSmall,
-                            normKeyX = 0.5f,
-                            normKeyY = 0.5f,
-                            cropXFull = cropXFull,
-                            cropYFull = cropYFull,
-                            minDimFull = minDimFull,
-                            sWidth = sW.toFloat(),
-                            sHeight = sH.toFloat(),
-                            invVpMatrix = snapInvVp,
-                            tableY = tableY,
-                            estHeightM = estHeight,
-                            camX = snapCamX,
-                            camZ = snapCamZ,
-                            angleStepDeg = 2
-                        )
-                        squareSmall.recycle()
-                        lastPreLockLatencyMs = System.currentTimeMillis() - t0
-
-                        // Reject stale mid-pan frames (> 15° turn or > 8cm translation while running)
-                        val rotDot = snapFwdX * liveCamFwdX + snapFwdY * liveCamFwdY + snapFwdZ * liveCamFwdZ
-                        val camShift = sqrt(
-                            (liveCamX - snapCamX).pow(2) +
-                                (liveCamY - snapCamY).pow(2) +
-                                (liveCamZ - snapCamZ).pow(2)
-                        )
-                        if (rotDot < 0.965f || camShift > 0.08f) {
-                            return@execute
-                        }
-
-                        if (fit != null && !isBoxPlaced) {
-                            val targetH = if (measuredHeightM > 0.015f) {
-                                measuredHeightM
-                            } else {
-                                (min(fit.widthM, fit.depthM) * 0.45f).coerceIn(0.03f, 0.14f)
-                            }
-
-                            val posJump = sqrt((fit.worldX - liveWorldX).pow(2) + (fit.worldZ - liveWorldZ).pow(2))
-                            val prevArea = (liveWidth * liveDepth).coerceAtLeast(1e-4f)
-                            val areaRatio = abs((fit.widthM * fit.depthM) - prevArea) / prevArea
-
-                            if (!hasLiveCling || posJump > 0.05f || areaRatio > 0.40f) {
-                                liveWorldX = fit.worldX
-                                liveWorldY = tableY
-                                liveWorldZ = fit.worldZ
-                                liveWidth = fit.widthM
-                                liveDepth = fit.depthM
-                                liveHeight = targetH
-                                liveAzimuth = fit.headingRad
-                                liveCos2A = cos(fit.headingRad * 2f)
-                                liveSin2A = sin(fit.headingRad * 2f)
-                                liveClingScreenX = fit.screenCX
-                                liveClingScreenY = fit.screenCY
-                                hasLiveCling = true
-                            } else {
-                                val alphaPos = 0.85f
-                                val alphaDim = 0.82f
-                                liveWorldX += alphaPos * (fit.worldX - liveWorldX)
-                                liveWorldY = tableY
-                                liveWorldZ += alphaPos * (fit.worldZ - liveWorldZ)
-                                liveWidth += alphaDim * (fit.widthM - liveWidth)
-                                liveDepth += alphaDim * (fit.depthM - liveDepth)
-                                liveHeight += alphaDim * (targetH - liveHeight)
-
-                                liveCos2A = liveCos2A * 0.25f + cos(fit.headingRad * 2f) * 0.75f
-                                liveSin2A = liveSin2A * 0.25f + sin(fit.headingRad * 2f) * 0.75f
-                                var smoothedAxis = 0.5f * atan2(liveSin2A, liveCos2A)
-                                val camAngleNow = atan2(snapCamX - liveWorldX, snapCamZ - liveWorldZ)
-                                if (sin(smoothedAxis) * sin(camAngleNow) + cos(smoothedAxis) * cos(camAngleNow) < 0f) {
-                                    smoothedAxis += Math.PI.toFloat()
-                                }
-                                liveAzimuth = smoothedAxis
-
-                                liveClingScreenX += alphaPos * (fit.screenCX - liveClingScreenX)
-                                liveClingScreenY += alphaPos * (fit.screenCY - liveClingScreenY)
-                            }
-                        } else {
-                            // Instant release back to blue scanning ring when aimed at empty table
-                            hasLiveCling = false
-                        }
-                    } catch (e: Exception) {
-                        logDebug("⚠️ Live MagicTouch Err: ${e.message}")
-                    } finally {
-                        isPreLockMlRunning = false
-                    }
-                }
-            },
-            mainHandler
-        )
     }
 
     // =========================================================================
-    // PHASE 2: STRICT TABLE-GROUNDED LOCK + HIGH-PRECISION MAGICTOUCH CONFIRM
+    // PHASE 2: STRICT TABLE-GROUNDED LOCK + ONE-SHOT MAGICTOUCH REFINEMENT
     // =========================================================================
+    private data class MagicTouch3DFit(
+        val worldX: Float,
+        val worldZ: Float,
+        val widthM: Float,
+        val depthM: Float,
+        val headingRad: Float,
+        val screenCX: Float,
+        val screenCY: Float
+    )
+
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
         val (tablePlane, tablePose) = resolveStrictTableSurface(frame)
@@ -1319,7 +1076,7 @@ class MainActivity : AppCompatActivity() {
             initialAzimuth = liveAzimuth
             seedScreenX = liveClingScreenX
             seedScreenY = liveClingScreenY
-            logDebug("✓ Locked Live MagicTouch (${lastPreLockLatencyMs}ms): ${(prismWidth * 100).roundToInt()}x${(prismDepth * 100).roundToInt()}x${(prismHeight * 100).roundToInt()}cm")
+            logDebug("✓ Locked ML Kit Seed (${lastPreLockLatencyMs}ms): ${(prismWidth * 100).roundToInt()}x${(prismDepth * 100).roundToInt()}x${(prismHeight * 100).roundToInt()}cm")
         } else {
             anchor = createStabilizedTableAnchor(tablePose.tx(), tableY, tablePose.tz())
             val camPose = frame.camera.pose
@@ -1407,7 +1164,6 @@ class MainActivity : AppCompatActivity() {
             bitmap,
             PixelCopy.OnPixelCopyFinishedListener { copyResult ->
                 if (copyResult == PixelCopy.SUCCESS) {
-                    // Run on mlExecutor so it never collides with an in-flight pre-lock inference
                     mlExecutor.execute {
                         try {
                             val interp = magicTouchInterpreter ?: return@execute
@@ -1421,7 +1177,7 @@ class MainActivity : AppCompatActivity() {
                             val normSeedX = ((seedScreenX - cropX) / minDim).coerceIn(0.15f, 0.85f)
                             val normSeedY = ((seedScreenY - cropY) / minDim).coerceIn(0.15f, 0.85f)
 
-                            // Pass 1: Exact tracked centroid (1° calipers sweep)
+                            // Pass 1: Prompt at ML Kit's exact tracked object center (1° calipers sweep)
                             var fit = runMagicTouchSolveOnWorker(
                                 interp = interp,
                                 squareBmp = squareBmp,
@@ -1436,11 +1192,10 @@ class MainActivity : AppCompatActivity() {
                                 tableY = tableY,
                                 estHeightM = seedHeightM,
                                 camX = camX,
-                                camZ = camZ,
-                                angleStepDeg = 1
+                                camZ = camZ
                             )
 
-                            // Pass 2 (Fallback): Exact center crosshair (0.5, 0.5)
+                            // Pass 2 (Fallback): Exact screen center (0.5, 0.5)
                             if (fit == null && (abs(normSeedX - 0.5f) > 0.02f || abs(normSeedY - 0.5f) > 0.02f)) {
                                 fit = runMagicTouchSolveOnWorker(
                                     interp = interp,
@@ -1456,8 +1211,7 @@ class MainActivity : AppCompatActivity() {
                                     tableY = tableY,
                                     estHeightM = seedHeightM,
                                     camX = camX,
-                                    camZ = camZ,
-                                    angleStepDeg = 1
+                                    camZ = camZ
                                 )
                             }
                             squareBmp.recycle()
@@ -1487,7 +1241,7 @@ class MainActivity : AppCompatActivity() {
                                     val dCm = (prismDepth * 100).roundToInt()
                                     val hCm = (prismHeight * 100).roundToInt()
                                     val yawDeg = Math.toDegrees(lockedFit.headingRad.toDouble()).roundToInt()
-                                    logDebug("✓ MagicTouch Confirmed (${elapsed}ms): ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
+                                    logDebug("✓ MagicTouch Refined (${elapsed}ms): ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
                                     Toast.makeText(
                                         this@MainActivity,
                                         "✓ MagicTouch Locked: ${wCm}×${dCm}×${hCm}cm",
@@ -1495,10 +1249,10 @@ class MainActivity : AppCompatActivity() {
                                     ).show()
                                 }
                             } else {
-                                logDebug("ℹ️ Kept Live MagicTouch fit (${elapsed}ms)")
+                                logDebug("ℹ️ Kept ML Kit Lock (${elapsed}ms)")
                             }
                         } catch (e: Exception) {
-                            logDebug("❌ Lock Confirm Err: ${e.javaClass.simpleName}: ${e.message}")
+                            logDebug("❌ MagicTouch Lock Err: ${e.javaClass.simpleName}: ${e.message}")
                         } finally {
                             bitmap.recycle()
                         }
@@ -1506,6 +1260,315 @@ class MainActivity : AppCompatActivity() {
                 }
             },
             mainHandler
+        )
+    }
+
+    private fun runMagicTouchSolveOnWorker(
+        interp: Interpreter,
+        squareBmp: Bitmap,
+        normKeyX: Float,
+        normKeyY: Float,
+        cropXFull: Float,
+        cropYFull: Float,
+        minDimFull: Float,
+        sWidth: Float,
+        sHeight: Float,
+        invVpMatrix: FloatArray,
+        tableY: Float,
+        estHeightM: Float,
+        camX: Float,
+        camZ: Float
+    ): MagicTouch3DFit? {
+        val scaled = if (squareBmp.width == mtInW && squareBmp.height == mtInH) {
+            squareBmp
+        } else {
+            Bitmap.createScaledBitmap(squareBmp, mtInW, mtInH, true)
+        }
+
+        val pixCount = mtInW * mtInH
+        val pixels = mtPixelBuf ?: IntArray(pixCount).also { mtPixelBuf = it }
+        scaled.getPixels(pixels, 0, mtInW, 0, 0, mtInW, mtInH)
+        if (scaled !== squareBmp) scaled.recycle()
+
+        val inputBuf = mtInputBuf ?: return null
+        val outputBuf = mtOutputBuf ?: return null
+        inputBuf.clear()
+
+        val keyPxX = normKeyX * mtInW
+        val keyPxY = normKeyY * mtInH
+        val invTwoSigmaSq = 1.0f / (2.0f * 12.0f * 12.0f)
+        val inv255 = 1.0f / 255.0f
+
+        if (mtInType == DataType.FLOAT32) {
+            val fIn = mtFloatInput ?: FloatArray(pixCount * mtInC).also { mtFloatInput = it }
+            var outIdx = 0
+            var pIdx = 0
+            for (y in 0 until mtInH) {
+                val dy = y - keyPxY
+                val dySq = dy * dy
+                for (x in 0 until mtInW) {
+                    val px = pixels[pIdx++]
+                    fIn[outIdx++] = ((px shr 16) and 0xFF) * inv255
+                    fIn[outIdx++] = ((px shr 8) and 0xFF) * inv255
+                    fIn[outIdx++] = (px and 0xFF) * inv255
+                    if (mtInC >= 4) {
+                        val dx = x - keyPxX
+                        fIn[outIdx++] = exp(-(dx * dx + dySq) * invTwoSigmaSq)
+                    }
+                }
+            }
+            inputBuf.asFloatBuffer().put(fIn)
+        } else {
+            var pIdx = 0
+            for (y in 0 until mtInH) {
+                val dy = y - keyPxY
+                val dySq = dy * dy
+                for (x in 0 until mtInW) {
+                    val px = pixels[pIdx++]
+                    inputBuf.put(((px shr 16) and 0xFF).toByte())
+                    inputBuf.put(((px shr 8) and 0xFF).toByte())
+                    inputBuf.put((px and 0xFF).toByte())
+                    if (mtInC >= 4) {
+                        val dx = x - keyPxX
+                        val g = exp(-(dx * dx + dySq) * invTwoSigmaSq)
+                        inputBuf.put((g * 255f).toInt().coerceIn(0, 255).toByte())
+                    }
+                }
+            }
+        }
+        inputBuf.rewind()
+        outputBuf.clear()
+
+        interp.run(inputBuf, outputBuf)
+        outputBuf.rewind()
+
+        val mH: Int; val mW: Int; val mC: Int
+        when (mtOutShape.size) {
+            4 -> if (mtOutShape[3] <= 4) { mH = mtOutShape[1]; mW = mtOutShape[2]; mC = mtOutShape[3] } else { mC = mtOutShape[1]; mH = mtOutShape[2]; mW = mtOutShape[3] }
+            3 -> { mH = mtOutShape[1]; mW = mtOutShape[2]; mC = 1 }
+            else -> return null
+        }
+
+        val floatOut = if (mtOutType == DataType.FLOAT32) {
+            val arr = mtFloatOutput ?: FloatArray(mW * mH * mC).also { mtFloatOutput = it }
+            outputBuf.asFloatBuffer().get(arr)
+            arr
+        } else {
+            null
+        }
+
+        fun scoreAt(mx: Int, my: Int): Float {
+            val i = my * mW + mx
+            return if (floatOut != null) {
+                if (mC == 1) floatOut[i] else (floatOut[i * mC + (mC - 1)] - floatOut[i * mC])
+            } else {
+                (outputBuf.get(i * mC + (mC - 1)).toInt() and 0xFF) * inv255
+            }
+        }
+
+        val seedX = (normKeyX * mW).toInt().coerceIn(8, mW - 9)
+        val seedY = (normKeyY * mH).toInt().coerceIn(8, mH - 9)
+        var seedSum = 0f; var seedCnt = 0
+        for (dy in -4..4) {
+            for (dx in -4..4) {
+                seedSum += scoreAt(seedX + dx, seedY + dy)
+                seedCnt++
+            }
+        }
+        val seedMean = seedSum / seedCnt
+
+        var borderSum = 0f; var borderCnt = 0
+        for (x in 0 until mW step 4) {
+            borderSum += scoreAt(x, 2) + scoreAt(x, mH - 3)
+            borderCnt += 2
+        }
+        for (y in 0 until mH step 4) {
+            borderSum += scoreAt(2, y) + scoreAt(mW - 3, y)
+            borderCnt += 2
+        }
+        val borderMean = borderSum / borderCnt.coerceAtLeast(1)
+
+        if (abs(seedMean - borderMean) < 0.04f) return null
+
+        val thresh = borderMean + (seedMean - borderMean) * 0.48f
+        val seedIsHigher = seedMean > borderMean
+
+        val gSize = 128
+        val gridMask = BooleanArray(gSize * gSize)
+        for (gy in 1 until gSize - 1) {
+            val my = (gy * mH) / gSize
+            for (gx in 1 until gSize - 1) {
+                val mx = (gx * mW) / gSize
+                val s = scoreAt(mx, my)
+                gridMask[gy * gSize + gx] = if (seedIsHigher) (s >= thresh) else (s <= thresh)
+            }
+        }
+
+        val seedGX = (normKeyX * gSize).toInt().coerceIn(4, gSize - 5)
+        val seedGY = (normKeyY * gSize).toInt().coerceIn(4, gSize - 5)
+        var startIdx = -1
+        var bestDist = Int.MAX_VALUE
+        for (gy in (seedGY - 10)..(seedGY + 10)) {
+            for (gx in (seedGX - 10)..(seedGX + 10)) {
+                if (gx in 1 until (gSize - 1) && gy in 1 until (gSize - 1)) {
+                    val idx = gy * gSize + gx
+                    if (gridMask[idx]) {
+                        val d = (gx - seedGX) * (gx - seedGX) + (gy - seedGY) * (gy - seedGY)
+                        if (d < bestDist) { bestDist = d; startIdx = idx }
+                    }
+                }
+            }
+        }
+        if (startIdx == -1) return null
+
+        val visited = BooleanArray(gSize * gSize)
+        val queue = ArrayDeque<Int>()
+        queue.add(startIdx)
+        visited[startIdx] = true
+
+        val fgScreenX = mutableListOf<Float>()
+        val fgScreenY = mutableListOf<Float>()
+        var sumX = 0f; var sumY = 0f
+        var touchesLeft = false; var touchesRight = false
+        var touchesTop = false; var touchesBottom = false
+
+        while (!queue.isEmpty()) {
+            val curr = queue.removeFirst()
+            val cx = curr % gSize
+            val cy = curr / gSize
+
+            if (cx <= 2) touchesLeft = true
+            if (cx >= gSize - 3) touchesRight = true
+            if (cy <= 2) touchesTop = true
+            if (cy >= gSize - 3) touchesBottom = true
+
+            val sx = cropXFull + ((cx + 0.5f) / gSize) * minDimFull
+            val sy = cropYFull + ((cy + 0.5f) / gSize) * minDimFull
+            fgScreenX.add(sx); fgScreenY.add(sy)
+            sumX += sx; sumY += sy
+
+            for (ny in (cy - 1)..(cy + 1)) {
+                for (nx in (cx - 1)..(cx + 1)) {
+                    if (nx in 1 until (gSize - 1) && ny in 1 until (gSize - 1)) {
+                        val nIdx = ny * gSize + nx
+                        if (gridMask[nIdx] && !visited[nIdx]) {
+                            visited[nIdx] = true
+                            queue.add(nIdx)
+                        }
+                    }
+                }
+            }
+        }
+
+        val count = fgScreenX.size
+        val edgeCount = (if (touchesLeft) 1 else 0) + (if (touchesRight) 1 else 0) +
+            (if (touchesTop) 1 else 0) + (if (touchesBottom) 1 else 0)
+        if (count < 25 || count > (gSize * gSize * 0.68f).toInt() || edgeCount >= 3) {
+            return null
+        }
+
+        val barX = sumX / count
+        val barY = sumY / count
+
+        var bestArea = Float.MAX_VALUE
+        var bestRad = 0f
+        for (deg in 0 until 90) {
+            val rad = Math.toRadians(deg.toDouble()).toFloat()
+            val c = cos(rad); val s = sin(rad)
+            var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
+            var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
+
+            for (i in 0 until count) {
+                val dx = fgScreenX[i] - barX
+                val dy = fgScreenY[i] - barY
+                val pu = dx * c + dy * s
+                val pv = -dx * s + dy * c
+                if (pu < minU) minU = pu
+                if (pu > maxU) maxU = pu
+                if (pv < minV) minV = pv
+                if (pv > maxV) maxV = pv
+            }
+            val area = (maxU - minU).coerceAtLeast(10f) * (maxV - minV).coerceAtLeast(10f)
+            if (area < bestArea) { bestArea = area; bestRad = rad }
+        }
+
+        val uX = cos(bestRad); val uY = sin(bestRad)
+        val vX = -uY; val vY = uX
+
+        var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
+        var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
+        for (i in 0 until count) {
+            val dx = fgScreenX[i] - barX
+            val dy = fgScreenY[i] - barY
+            val pu = dx * uX + dy * uY
+            val pv = dx * vX + dy * vY
+            if (pu < minU) minU = pu
+            if (pu > maxU) maxU = pu
+            if (pv < minV) minV = pv
+            if (pv > maxV) maxV = pv
+        }
+
+        val midU = (minU + maxU) * 0.5f
+        val midV = (minV + maxV) * 0.5f
+        val halfSpan1Px = ((maxU - minU) * 0.5f).coerceAtLeast(14f)
+        val halfSpan2Px = ((maxV - minV) * 0.5f).coerceAtLeast(14f)
+
+        val centerScreenX = barX + midU * uX + midV * vX
+        val centerScreenY = barY + midU * uY + midV * vY
+
+        val midPlaneY = tableY + estHeightM * 0.5f
+
+        val pCenterMid = intersectScreenRayWithHorizontalPlane(centerScreenX, centerScreenY, sWidth, sHeight, invVpMatrix, midPlaneY)
+        val p1AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan1Px * uX, centerScreenY + halfSpan1Px * uY, sWidth, sHeight, invVpMatrix, midPlaneY)
+        val p1BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan1Px * uX, centerScreenY - halfSpan1Px * uY, sWidth, sHeight, invVpMatrix, midPlaneY)
+        val p2AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan2Px * vX, centerScreenY + halfSpan2Px * vY, sWidth, sHeight, invVpMatrix, midPlaneY)
+        val p2BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan2Px * vX, centerScreenY - halfSpan2Px * vY, sWidth, sHeight, invVpMatrix, midPlaneY)
+
+        if (pCenterMid == null || p1AMid == null || p1BMid == null || p2AMid == null || p2BMid == null) return null
+
+        val v1X = p1AMid[0] - p1BMid[0]; val v1Z = p1AMid[2] - p1BMid[2]
+        val span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceIn(0.035f, 0.45f)
+        val u1X = v1X / span1; val u1Z = v1Z / span1
+
+        val v2X = p2AMid[0] - p2BMid[0]; val v2Z = p2AMid[2] - p2BMid[2]
+        val span2 = sqrt(v2X * v2X + v2Z * v2Z).coerceIn(0.035f, 0.45f)
+        val u2X = v2X / span2; val u2Z = v2Z / span2
+
+        val camAngle = atan2(camX - pCenterMid[0], camZ - pCenterMid[2])
+        val camDirX = sin(camAngle); val camDirZ = cos(camAngle)
+
+        val dot0 = u1X * camDirX + u1Z * camDirZ
+        val dot1 = -dot0
+        val dot2 = u2X * camDirX + u2Z * camDirZ
+        val dot3 = -dot2
+
+        val dots = floatArrayOf(dot0, dot1, dot2, dot3)
+        var bestIdx = 0
+        var maxDot = -Float.MAX_VALUE
+        for (i in 0 until 4) {
+            if (dots[i] > maxDot) { maxDot = dots[i]; bestIdx = i }
+        }
+
+        val margin = 1.06f
+        val finalWidth: Float
+        val finalDepth: Float
+        val headingAngle: Float
+
+        when (bestIdx) {
+            0 -> { finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(u1X, u1Z) }
+            1 -> { finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(-u1X, -u1Z) }
+            2 -> { finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(u2X, u2Z) }
+            else -> { finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f); finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f); headingAngle = atan2(-u2X, -u2Z) }
+        }
+
+        return MagicTouch3DFit(
+            worldX = pCenterMid[0],
+            worldZ = pCenterMid[2],
+            widthM = finalWidth,
+            depthM = finalDepth,
+            headingRad = headingAngle,
+            screenCX = centerScreenX,
+            screenCY = centerScreenY
         )
     }
 
@@ -1580,11 +1643,13 @@ class MainActivity : AppCompatActivity() {
             if (tablePlane != null && tablePose != null) {
                 liveWorldY = tablePlane.centerPose.ty()
 
-                if (!isPreLockMlRunning && (now - lastPreLockMlTriggerMs) >= 80L) {
-                    triggerPreLockMagicTouch(frame, tablePose)
+                // 33ms cadence targets real-time ~30 FPS ML Kit streaming
+                if (!isPreLockMlRunning && (now - lastPreLockMlTriggerMs) >= 33L) {
+                    triggerPreLockMlKitDetector(frame, tablePose)
                 }
             } else {
                 hasLiveCling = false
+                lastTrackedObjectId = null
             }
 
             overlayView.updatePreLockSnapshot(frameVpMatrix, tablePose)
@@ -1593,13 +1658,13 @@ class MainActivity : AppCompatActivity() {
             if (shouldUpdateHud) {
                 lastHudUpdateMs = now
                 if (lastPreLockLatencyMs > 0L) {
-                    setTextIfChanged(valAlign, "ML: ${lastPreLockLatencyMs}ms")
+                    setTextIfChanged(valAlign, "DET: ${lastPreLockLatencyMs}ms")
                 }
                 if (hasLiveCling && tablePlane != null) {
                     val wCm = (liveWidth * 100).roundToInt()
                     val dCm = (liveDepth * 100).roundToInt()
                     val hCm = (liveHeight * 100).roundToInt()
-                    setTextIfChanged(distIndicator, "◎ MAGICTOUCH FIT: ${wCm}×${dCm}×${hCm}cm — TAP LOCK", Color.parseColor("#3FB950"))
+                    setTextIfChanged(distIndicator, "◎ MLKIT LIVE FIT: ${wCm}×${dCm}×${hCm}cm — TAP LOCK", Color.parseColor("#3FB950"))
                     setTextIfChanged(valScale, "RING: ${wCm}×${dCm}")
                 } else if (tablePlane != null) {
                     setTextIfChanged(distIndicator, "TABLE PLANE LOCKED: AIM DOT AT ASSET", Color.parseColor("#58A6FF"))
@@ -2036,17 +2101,16 @@ class MainActivity : AppCompatActivity() {
             val screenH = height.toFloat()
 
             // =========================================================================
-            // PRE-LOCK PHASE: TABLE-GROUNDED LIVE MAGICTOUCH 3D ENCAPSULATING RING
+            // PRE-LOCK PHASE: TABLE-GROUNDED LIVE ML KIT 3D ENCAPSULATING RING
             // =========================================================================
             if (!isBoxPlaced) {
-                // Crisp center dot shows exact MagicTouch prompt location
                 canvas.drawCircle(screenW / 2f, screenH / 2f, 16f, centerGuidePaint)
                 canvas.drawCircle(screenW / 2f, screenH / 2f, 4.5f, centerDotPaint)
 
                 if (hasLiveCling && snapHitPose != null) {
-                    // 0.55f half-span hugs the exact MagicTouch prism footprint tightly
-                    val rx = (liveWidth * 0.55f).coerceIn(0.025f, 0.26f)
-                    val rz = (liveDepth * 0.55f).coerceIn(0.025f, 0.26f)
+                    // 0.62f collar radius wraps all rectangular corners cleanly
+                    val rx = (liveWidth * 0.62f).coerceIn(0.028f, 0.28f)
+                    val rz = (liveDepth * 0.62f).coerceIn(0.028f, 0.28f)
                     val ringH = liveHeight.coerceIn(0.028f, 0.24f)
 
                     val basePts = mutableListOf<PointF?>()
