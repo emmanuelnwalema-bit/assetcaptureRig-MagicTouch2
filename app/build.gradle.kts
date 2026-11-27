@@ -89,10 +89,7 @@ dependencies {
     implementation("com.google.ar:core:1.41.0")
     implementation("io.github.sceneview:arsceneview:2.2.1")
 
-    // Real-time Pre-Lock Object Detection & Tracking (STREAM_MODE)
-    implementation("com.google.mlkit:object-detection:17.0.2")
-
-    // One-Shot Lock Precision Segmentation (magic_touch.tflite)
+    // On-Device Segmentation (magic_touch.tflite)
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
 
     // Networking for Modal Batch Upload
