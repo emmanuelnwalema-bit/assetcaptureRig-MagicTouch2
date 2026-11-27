@@ -89,8 +89,10 @@ dependencies {
     implementation("com.google.ar:core:1.41.0")
     implementation("io.github.sceneview:arsceneview:2.2.1")
 
-    // Lightweight TFLite runtime for magic_touch.tflite (zero dex conflicts with Sceneview)
+    // TFLite Runtime + GPU Delegate for real-time u2netp.tflite & magic_touch.tflite
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.14.0")
 
     // Networking for Modal Batch Upload
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
