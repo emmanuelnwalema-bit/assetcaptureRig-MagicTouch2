@@ -32,8 +32,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.CompatibilityList
 import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.gpu.GpuDelegateFactory
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -88,18 +88,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (GPU U2Net-P + MagicTouch Cascade)\n")
+    private val debugLog = StringBuilder("App Initialized (Direct GPU U2Net-P + MagicTouch)\n")
     private var toneGen: ToneGenerator? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // =========================================================
     // TWO-MODEL ON-DEVICE CASCADE (GPU U2Net-P -> MagicTouch)
     // =========================================================
-    // Dedicated single-thread executor preserves Android EGL/OpenCL context affinity for GpuDelegate
+    // Dedicated single-thread executor preserves EGL/OpenCL thread affinity for GpuDelegate
     private val u2netExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var u2netGpuDelegate: GpuDelegate? = null
     @Volatile private var u2netInterpreter: Interpreter? = null
-    @Volatile private var u2netUsingGpu = false
+    @Volatile private var u2netBackendTag = "U2NET-CPU"
     @Volatile private var lastPreLockLatencyMs = 0L
 
     @Volatile private var magicTouchInterpreter: Interpreter? = null
@@ -380,31 +380,45 @@ class MainActivity : AppCompatActivity() {
                 logDebug("Loading Model 1: $u2netAssetName...")
                 val modelBuffer = mapAssetBuffer(u2netAssetName)
                 var interp: Interpreter? = null
-                var gpuActive = false
+                var activeBackend = "CPU-XNNPACK"
+                var hudTag = "U2NET-CPU"
 
-                val compatList = CompatibilityList()
-                try {
-                    if (compatList.isDelegateSupportedOnThisDevice) {
-                        try {
-                            val gpuOpts = compatList.bestOptionsForThisDevice
-                            val delegate = GpuDelegate(gpuOpts)
-                            val opts = Interpreter.Options().apply {
-                                addDelegate(delegate)
-                            }
-                            interp = Interpreter(modelBuffer, opts)
-                            u2netGpuDelegate = delegate
-                            gpuActive = true
-                        } catch (gpuErr: Throwable) {
-                            logDebug("⚠️ U2Net-P GPU Delegate declined (${gpuErr.javaClass.simpleName}): falling back to CPU XNNPACK")
-                            try { u2netGpuDelegate?.close() } catch (_: Exception) {}
-                            u2netGpuDelegate = null
+                // Bypass TFLite 2.14's outdated CompatibilityList and test GPU backends directly
+                val gpuBackends = listOf(
+                    Triple("GPU-OpenCL", "U2NET-CL", GpuDelegateFactory.Options.GpuBackend.OPENCL),
+                    Triple("GPU-OpenGL", "U2NET-GL", GpuDelegateFactory.Options.GpuBackend.OPENGL)
+                )
+
+                for ((label, tag, backend) in gpuBackends) {
+                    var candidateDelegate: GpuDelegate? = null
+                    try {
+                        modelBuffer.rewind()
+                        val gpuOpts = GpuDelegateFactory.Options().apply {
+                            setPrecisionLossAllowed(true)
+                            setInferencePreference(GpuDelegateFactory.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED)
+                            setForceBackend(backend)
+                            setSerializationParams(codeCacheDir.absolutePath, "u2netp_${label}_v1")
                         }
+                        candidateDelegate = GpuDelegate(gpuOpts)
+                        val opts = Interpreter.Options().apply {
+                            addDelegate(candidateDelegate)
+                        }
+                        val candidateInterp = Interpreter(modelBuffer, opts)
+                        candidateInterp.allocateTensors()
+
+                        interp = candidateInterp
+                        u2netGpuDelegate = candidateDelegate
+                        activeBackend = label
+                        hudTag = tag
+                        break
+                    } catch (gpuErr: Throwable) {
+                        logDebug("⚠️ $label failed: ${gpuErr.javaClass.simpleName}: ${gpuErr.message}")
+                        try { candidateDelegate?.close() } catch (_: Exception) {}
                     }
-                } finally {
-                    compatList.close()
                 }
 
                 if (interp == null) {
+                    modelBuffer.rewind()
                     val cpuOpts = Interpreter.Options().apply {
                         setNumThreads(4)
                         setUseXNNPACK(true)
@@ -413,16 +427,14 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 u2netInterpreter = interp
-                u2netUsingGpu = gpuActive
+                u2netBackendTag = hudTag
 
-                // Pre-allocate reusable input/output buffers on u2netExecutor
                 val inTensor = interp.getInputTensor(0)
                 val outTensor = interp.getOutputTensor(0)
                 u2netInputBuf = ByteBuffer.allocateDirect(inTensor.numBytes()).order(ByteOrder.nativeOrder())
                 u2netOutputBuf = ByteBuffer.allocateDirect(outTensor.numBytes()).order(ByteOrder.nativeOrder())
 
-                val backend = if (gpuActive) "GPU" else "CPU-XNNPACK"
-                logDebug("✓ U2Net-P Ready [$backend]! In:${inTensor.shape().contentToString()} Out:${outTensor.shape().contentToString()}")
+                logDebug("✓ U2Net-P Ready [$activeBackend]! In:${inTensor.shape().contentToString()} Out:${outTensor.shape().contentToString()}")
             } catch (e: Exception) {
                 logDebug("⚠️ $u2netAssetName not found — pre-lock will use live MagicTouch fallback")
             }
@@ -907,10 +919,6 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * Runs U2Net-P (GPU-accelerated on u2netExecutor) using pre-allocated ByteBuffers
-     * and returns a clean binary salient mask on a 96x96 grid.
-     */
     private fun runU2NetSaliencyMask(interp: Interpreter, squareBmp: Bitmap): Pair<BooleanArray, Int>? {
         val inTensor = interp.getInputTensor(0)
         val inShape = inTensor.shape()
@@ -1121,7 +1129,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handlePreLockMiss() {
-        // Instant release on pan-away (no multi-second off-screen freeze)
         liveClingMissCount++
         if (liveClingMissCount >= 1) {
             hasLiveCling = false
@@ -1325,7 +1332,6 @@ class MainActivity : AppCompatActivity() {
 
         liveClingMissCount = 0
 
-        // Snap 100% immediately on first lock, target switch (>6cm jump), or major scale shift (>45%)
         val posJump = sqrt((pCenterMid[0] - liveWorldX).pow(2) + (pCenterMid[2] - liveWorldZ).pow(2))
         val prevArea = (liveWidth * liveDepth).coerceAtLeast(1e-4f)
         val areaRatio = abs((targetW * targetD) - prevArea) / prevArea
@@ -1344,7 +1350,6 @@ class MainActivity : AppCompatActivity() {
             liveClingScreenY = boxScreenCY
             hasLiveCling = true
         } else {
-            // Fast, responsive tracking with zero slow shrink-down creep
             val alphaPos = 0.85f
             val alphaDim = 0.82f
             liveWorldX += alphaPos * (pCenterMid[0] - liveWorldX)
@@ -1392,7 +1397,7 @@ class MainActivity : AppCompatActivity() {
             initialAzimuth = liveAzimuth
             seedScreenX = liveClingScreenX
             seedScreenY = liveClingScreenY
-            logDebug("✓ Locked U2Net-P Seed (${lastPreLockLatencyMs}ms): ${(prismWidth * 100).roundToInt()}x${(prismDepth * 100).roundToInt()}x${(prismHeight * 100).roundToInt()}cm")
+            logDebug("✓ Locked $u2netBackendTag Seed (${lastPreLockLatencyMs}ms): ${(prismWidth * 100).roundToInt()}x${(prismDepth * 100).roundToInt()}x${(prismHeight * 100).roundToInt()}cm")
         } else {
             anchor = createStabilizedTableAnchor(tablePose.tx(), tableY, tablePose.tz())
             val camPose = frame.camera.pose
@@ -1944,11 +1949,7 @@ class MainActivity : AppCompatActivity() {
 
             if (shouldUpdateHud) {
                 lastHudUpdateMs = now
-                val tag = when {
-                    u2netInterpreter != null && u2netUsingGpu -> "U2NET-GPU"
-                    u2netInterpreter != null -> "U2NET-CPU"
-                    else -> "AI"
-                }
+                val tag = if (u2netInterpreter != null) u2netBackendTag else "AI"
                 if (lastPreLockLatencyMs > 0L) {
                     setTextIfChanged(valAlign, "ML: ${lastPreLockLatencyMs}ms")
                 }
